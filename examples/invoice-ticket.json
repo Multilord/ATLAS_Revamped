@@ -1,0 +1,15 @@
+{
+  "ticket_id": "INC-28492",
+  "title": "Supplier invoice posting fails after migration",
+  "description": "Invoice posting fails with F5 808 for a migrated vendor. Payment terms appear to be missing in the company-code view.",
+  "application": "SAP Finance",
+  "version": "S/4HANA 2023",
+  "customer": "Atlas Manufacturing",
+  "error_code": "F5 808",
+  "type": "Incident",
+  "priority": "High",
+  "timeline": [
+    {"at": "2026-10-13T09:00:00+08:00", "author": "Service desk", "text": "Invoice cannot be posted after vendor migration."},
+    {"at": "2026-10-13T09:30:00+08:00", "author": "Finance consultant", "text": "Checking vendor payment terms against approved master data."}
+  ]
+}
