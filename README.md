@@ -1,65 +1,69 @@
-# Solution Intelligence Engine
+# ATLAS Solution Intelligence Engine
 
-A working local prototype for evidence-led enterprise support investigations, based on the supplied 45-page solution brief. Built with Python's standard library, SQLite and browser JavaScript. No package installation, credentials, external APIs or build step required.
+A MongoDB-backed investigation workspace with OpenAI ticket extraction, semantic retrieval and source-cited recommendations. Starts empty: no seeded tickets, sample knowledge or simulated AI responses.
 
-## Run
+## Setup
 
-Requires Python 3.10 or later. From this directory:
+Requires Python 3.10+, MongoDB 8 and an OpenAI API key.
 
 ```powershell
-python server.py
+python -m venv .venv
+.\.venv\Scripts\python.exe -m pip install -r requirements.txt
+Copy-Item .env.example .env  # First setup only; preserve an existing .env
 ```
 
-Open http://127.0.0.1:8000. Use `python server.py --port 8001` if needed. Stop with Ctrl+C. The server binds only to loopback. `npm start` is an optional equivalent if Python is on PATH.
+Edit `.env` locally:
 
-## Try the complete flow
+```dotenv
+OPENAI_API_KEY=
+OPENAI_MODEL=gpt-4.1-mini
+OPENAI_EMBEDDING_MODEL=text-embedding-3-small
+MONGODB_URI=mongodb://127.0.0.1:27017
+MONGODB_DATABASE=atlas_solution_engine
+WORKSPACE_CUSTOMER=My Workspace
+CONSULTANT_NAME=Consultant
+PORT=8000
+```
 
-1. Choose **New investigation**, then **Use a sample invoice ticket**, or upload `examples/invoice-ticket.json`.
-2. Review the extracted fields and imported chronology. Correct the application and release before creating the investigation.
-3. Choose **Find supporting evidence**. Review ranking reasons, source excerpts, conflicting guidance and the legacy ECC version warning.
-4. Add observations or test results in **Evidence & Notes**. New evidence invalidates old recommendations; run a fresh search.
-5. Select a recommendation for validation. In **Outcome**, record testing, customer confirmation and the final result.
-6. Visit **Insights** to see updated counts. Refresh or restart the server to verify persistence.
+Put your key after OPENAI_API_KEY=. The file is Git-ignored; credentials remain server-side. Restart after changing configuration. Set the workspace name before creating records: it controls which records are visible.
 
-Try an unrelated printer issue to exercise insufficient evidence. A change request requires approval, development, deployment and verification in addition to testing and customer confirmation before a resolved outcome can be recorded.
-
-## Implemented
-
-- Dashboard, searchable/filterable investigations, knowledge library and local outcome insights.
-- Dedicated investigation workspace: Overview, Timeline, Recommendations, Evidence & Notes, Outcome.
-- Reviewed TXT/JSON intake with bounded input, timestamp normalization and source references.
-- Persisted investigations, chronological evidence, accept/reject decisions, validated outcomes and audit events.
-- Keyword retrieval with synonym normalization, exact error matching, application/release compatibility, freshness and recorded validation evidence.
-- Confidence categories, explicit abstention and curated conflict indicators. Relevance points are uncalibrated heuristics, never success probabilities.
-- Customer filtering in storage reads and retrieval. The demo principal is fixed server-side to Atlas Manufacturing; general sources are reusable. A restricted second-customer fixture is excluded from responses.
-- Clear sample-data and disconnected-integration labels. No invented accuracy or time-saving metrics.
-
-## Prototype boundaries
-
-This first slice is an executable development baseline, **not production authentication or AI**. The local server uses one fixed demo principal and is intended for one consultant on one machine. All seeded knowledge is synthetic, including error-code associations and procedures; it is not official SAP advice. The current engine is deterministic lexical retrieval, not embeddings, an LLM or semantic RAG. It does not execute SAP changes or connect to enterprise systems.
-
-Uploads currently support UTF-8 TXT and JSON. For attachments, paste relevant text and the filename into an Attachment note. PDF/Office extraction, binary attachments, live connectors, SSO/RBAC, per-document grants, calibrated hybrid retrieval, grounded model synthesis, robust multi-user concurrency and validated knowledge promotion are planned in `docs/DEVELOPMENT.md`.
-
-The database contains synthetic seed examples alongside user-created investigations. The UI marks seeded records. Counts include both; use a separate development database when evaluating real workflows. No automatic deletion/reset endpoint is provided.
-
-## Storage and tests
-
-SQLite is created at `data/solution-engine.sqlite3` (Git-ignored). Override the path with `SIE_DATABASE`. Tests use isolated temporary databases and never reset your working records.
+Start MongoDB using an existing installation, an Atlas URI, or Docker:
 
 ```powershell
-python -m unittest discover -s tests -v
+docker compose up -d mongodb
+.\.venv\Scripts\python.exe server.py
+```
+
+Open http://127.0.0.1:8000. On this development machine a portable MongoDB was downloaded into ignored tmp/mongodb/server; scripts/start-local-mongodb.ps1 starts it using data/mongodb. It is an alternative to Docker.
+
+## Use your own data
+
+1. Click **Check AI connection** to verify credentials and model access. Indexing and analysis exercise paid embeddings and generation.
+2. In **Knowledge**, upload actual documents or paste text. TXT, MD, JSON, text-based PDF and DOCX are supported, up to 5 MB. Review application, version and source reference before saving.
+3. Sources are stored in MongoDB and embedded. Failed indexing retains the document with an error and retry action. Only Ready sources with the configured embedding model are searched.
+4. Create an investigation from actual ticket text or a document. Review AI-extracted context before saving. Manual entry and structured JSON intake also work without a key.
+5. Run analysis. OpenAI synthesizes recommendations from retrieved chunks. Every recommendation must cite a supplied source and an exact quote; invalid citations reject the response. Insufficient evidence produces diagnostic next steps.
+6. Record evidence, decisions and validated outcomes. Promote outcomes to knowledge by reviewing and saving the draft. Verification requires recorded testing, customer confirmation and deployment evidence.
+
+Ticket and document text used for extraction, embedding and analysis is sent to OpenAI. Responses use store=False. Provider failures are explicit, with no simulated fallback. Changing embedding model requires reindexing.
+
+## Verification
+
+```powershell
+.\.venv\Scripts\python.exe -m pip install -r requirements-dev.txt
+.\.venv\Scripts\python.exe -m unittest discover -s tests -v
 node --check static/app.js
+# Include real MongoDB tests in an isolated temporary database:
+$env:RUN_MONGO_TESTS = '1'
+.\.venv\Scripts\python.exe -m unittest discover -s tests -v
 ```
 
-Tests cover tenant filtering, applicability ranking, abstention, imported chronology, malformed inputs, persisted outcomes, audit events, validation gates and HTTP boundaries. They are regression checks over synthetic fixtures, not a retrieval quality benchmark.
+Test doubles exist only in tests. Runtime storage and AI always use MongoDB and OpenAI. See docs/VALIDATION.md.
 
-## Structure
+## Deployment scope
 
-| Path | Responsibility |
-| --- | --- |
-| `server.py` | Local HTTP API, scoped SQLite storage, intake and workflow validation |
-| `engine.py` | Evidence retrieval, classification, ranking and abstention |
-| `seed.py` | Synthetic knowledge and investigation fixtures |
-| `static/` | Responsive browser UI, reusable rendering helpers and forms |
-| `tests/` | Isolated workflow, retrieval and transport regression tests |
-| `docs/` | Requirements interpretation, architecture and next milestones |
+Functional local, single-workspace application bound to loopback. SSO, roles, document ACLs, live enterprise connectors, background ingestion and production hosting are not implemented. Scope filtering does not replace authentication. Retrieval scores MongoDB-stored vectors in Python; large deployments need a vector index and background jobs. Confidence is heuristic and requires consultant validation.
+
+The former SQLite database is unused and not imported automatically; ignored files are preserved. Uploaded sources begin Unverified. Upload time does not establish the original guidance's freshness.
+
+server.py provides the API and workflow; storage.py handles scoped MongoDB persistence and optimistic concurrency; ai.py calls OpenAI; ingestion.py extracts and indexes documents; engine.py retrieves and validates evidence; static/ contains the UI.

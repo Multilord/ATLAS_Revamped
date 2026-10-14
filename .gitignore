@@ -2,5 +2,9 @@ __pycache__/
 *.pyc
 .venv/
 data/*.sqlite3*
+data/
 tmp/
 .env
+.env.*
+!.env.example
+.pytest_cache/

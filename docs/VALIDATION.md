@@ -1,17 +1,9 @@
-# Prototype validation
+# Validation â€” 14 October 2026
 
-Validated locally on 13 October 2026.
+31 automated tests passed, including real MongoDB 8.0.34 persistence. The MongoDB test creates a unique isolated database, checks empty initialization and persistence across clients, then drops only that test database. The application workspace remains empty.
 
-- **21 automated tests passed** using Python unittest, including HTTP requests to a temporary loopback service. Test databases are isolated from working data.
-- **JavaScript syntax check passed** with `node --check static/app.js`.
-- **Browser workflow passed:** sample ticket intake, context review, chronological communications, investigation creation, evidence search, original source inspection, test note, recommendation invalidation, refreshed search, solution selection and recorded outcome.
-- **Negative browser check passed:** selecting Resolved without testing and customer confirmation displayed the API validation error and retained the form contents.
-- **Persistence verified:** restarting the service and reloading retained the created case and its evidence.
-- **Knowledge empty state verified:** an unmatched query displays a clear empty result; clearing the query restores sources.
-- **Insights verified:** the saved outcome updates case counts and consultant usefulness feedback.
-- **Responsive check passed:** the 390 px viewport fits without page-level horizontal overflow. Icon-only navigation retains accessible names. The normal viewport was restored afterward.
-- **Browser error log:** no JavaScript errors observed in the tested session.
+Coverage: customer scope, optimistic concurrency, deduplication, embedding-model isolation, hidden vectors, indexing/retry, quote and citation rejection, abstention, confidence caps, provider failures, intake, chronology, outcome gates, note invalidation, TXT/PDF/DOCX extraction, HTTP origin checks and credential redaction.
 
-One clearly titled `[Demo QA]` investigation remains in the working local database to demonstrate the tested flow. Its notes and outcome explicitly state that validation was simulated and no real SAP system was changed. It is not included in source control. The screenshot in `dashboard-preview.jpg` captures the resulting workspace.
+OpenAI SDK transport tests validate request schemas and response parsing with an isolated test transport. No API key was provided, so live paid embeddings and generation could not be verified. Add a key to .env, restart, check AI connection, upload a genuine source and analyze a real ticket to verify the account's full path.
 
-These checks validate the local prototype's behavior. They do not establish retrieval accuracy, business time savings, enterprise security certification, SAP procedural correctness or live connector functionality.
+Browser checks confirm the empty workspace, MongoDB Connected status, missing-key feedback and knowledge upload form. JavaScript syntax passes. These checks are not a production security audit or retrieval-quality benchmark.
