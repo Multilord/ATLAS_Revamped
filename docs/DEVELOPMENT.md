@@ -4,7 +4,7 @@ The supplied brief describes consultant-led intake, investigation, evidence-back
 
 ## Architecture
 
-Browser â†’ loopback Python API â†’ customer-scoped MongoDB collections. OpenAI structured outputs extract context and synthesize recommendations. OpenAI embeddings index document chunks and investigation queries.
+Browser â†’ loopback Python API â†’ customer-scoped MongoDB collections. Gemini structured outputs extract context and synthesize recommendations. Gemini embeddings index document chunks and investigation queries.
 
 MongoDB stores original sources, embeddings, investigations, decisions, outcomes and embedded audit events. Revision checks prevent lost writes. Initialization creates indexes without inserting business records. SQLite and seeds are removed from runtime.
 
@@ -22,6 +22,6 @@ Further work includes live enterprise connectors, OCR, additional Office formats
 
 ## References
 
-- [OpenAI structured outputs](https://developers.openai.com/api/docs/guides/structured-outputs)
-- [OpenAI embeddings](https://developers.openai.com/api/docs/guides/embeddings)
+- [Gemini structured outputs](https://ai.google.dev/gemini-api/docs/structured-output)
+- [Gemini embeddings](https://ai.google.dev/gemini-api/docs/embeddings)
 - [PyMongo connections](https://www.mongodb.com/docs/languages/python/pymongo-driver/current/connect/)

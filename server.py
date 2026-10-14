@@ -1,4 +1,4 @@
-"""Local application server with MongoDB persistence and real OpenAI integration."""
+"""Local application server with MongoDB persistence and real Gemini integration."""
 import argparse
 import json
 import os
@@ -52,7 +52,8 @@ def health():
     except PyMongoError:
         database = 'Unavailable'
     return dict(database=database, ai='Configured (not yet checked)' if ai.configured else 'API key missing',
-        model=settings.model, embedding_model=settings.embedding_model, customer=CUSTOMER)
+        model=settings.model, embedding_model=settings.embedding_model, customer=CUSTOMER,
+        quota=ai.quota_status())
 
 
 def required_text(data, key, limit=12000):
@@ -67,7 +68,7 @@ def parse_intake(data, use_ai=False):
     filename = data.get('filename', '')
     if not isinstance(filename, str) or len(filename) > 255:
         raise ValueError('Invalid filename.')
-    if filename and Path(filename).suffix.lower() not in ('.txt', '.md', '.json', '.pdf', '.docx'):
+    if filename and Path(filename).suffix.lower() not in ('.txt', '.md', '.json', '.pdf', '.docx', '.xlsx', '.xlsm', '.xltx', '.csv'):
         raise ValueError('Unsupported ticket file format.')
     obj = {}
     if filename.lower().endswith('.json') or raw.lstrip().startswith('{'):
@@ -80,7 +81,7 @@ def parse_intake(data, use_ai=False):
         for key in ('title', 'description', 'application', 'version', 'ticket_id', 'error_code', 'customisation', 'type', 'priority'):
             if key in obj and not isinstance(obj[key], str):
                 raise ValueError(f'{key} must be text.')
-        if obj.get('customer', CUSTOMER) != CUSTOMER:
+        if obj.get('customer', CUSTOMER) != CUSTOMER and CUSTOMER not in ('My Workspace', 'All'):
             raise ValueError('This installation is scoped to ' + CUSTOMER + '.')
     elif use_ai:
         if len(raw) > 60000:
@@ -111,7 +112,8 @@ def parse_intake(data, use_ai=False):
 
 
 def create_investigation(data):
-    if data.get('customer', CUSTOMER) != CUSTOMER:
+    target_customer = data.get('customer', CUSTOMER)
+    if target_customer != CUSTOMER and CUSTOMER not in ('My Workspace', 'All'):
         raise ValueError('Customer scope is not authorised.')
     item = {key: required_text(data, key, size) for key, size in [('title', 200), ('description', 12000), ('application', 100), ('version', 100)]}
     for key in ('ticket_id', 'error_code', 'customisation'):
@@ -124,7 +126,7 @@ def create_investigation(data):
     # Revalidate imported history at the write boundary.
     timeline = parse_intake({'content': json.dumps({'description': item['description'], 'timeline': data.get('timeline', [])})})['timeline']
     stamp = now()
-    item.update(id='INV-' + uuid.uuid4().hex[:12].upper(), customer=CUSTOMER, type=data['type'], priority=data['priority'], status='New', created_at=stamp, updated_at=stamp, timeline=timeline, analysis=None, decisions={}, selected_source=None, outcome=None, revision=0)
+    item.update(id='INV-' + uuid.uuid4().hex[:12].upper(), customer=target_customer, type=data['type'], priority=data['priority'], status='New', created_at=stamp, updated_at=stamp, timeline=timeline, analysis=None, decisions={}, selected_source=None, outcome=None, revision=0)
     item['timeline'].append(dict(at=stamp, kind='Intake', text='Ticket context reviewed and investigation created.', author=settings.consultant, source=item['ticket_id'] or 'Manual intake'))
     save(item, 'created')
     return item
@@ -302,7 +304,7 @@ if __name__ == '__main__':
         print('MongoDB unavailable. The setup screen will show connection guidance.', flush=True)
     service = ThreadingHTTPServer(('127.0.0.1', args.port), Handler)
     print(f'Solution Intelligence Engine: http://127.0.0.1:{args.port}', flush=True)
-    print('MongoDB storage. OpenAI: ' + ('key configured' if ai.configured else 'set OPENAI_API_KEY in .env'), flush=True)
+    print('MongoDB storage. Gemini: ' + ('key configured' if ai.configured else 'set GEMINI_API_KEY in .env'), flush=True)
     try:
         service.serve_forever()
     except KeyboardInterrupt:

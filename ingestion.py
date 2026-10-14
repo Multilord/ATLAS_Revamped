@@ -11,6 +11,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from pypdf import PdfReader
 from docx import Document
+import openpyxl
 from ai import AIError
 
 MAX_FILE = 5 * 1024 * 1024
@@ -26,8 +27,8 @@ def extract_upload(data):
     if not isinstance(filename, str) or len(filename) > 255:
         raise ValueError('Invalid filename.')
     suffix = Path(filename).suffix.lower()
-    if suffix not in ('.txt', '.md', '.json', '.pdf', '.docx'):
-        raise ValueError('Upload TXT, MD, JSON, PDF or DOCX files.')
+    if suffix not in ('.txt', '.md', '.json', '.pdf', '.docx', '.xlsx', '.xlsm', '.xltx', '.csv'):
+        raise ValueError('Upload TXT, MD, JSON, PDF, DOCX, XLSX or CSV files.')
     try:
         content = base64.b64decode(data.get('file_base64', ''), validate=True)
     except (ValueError, TypeError, binascii.Error):
@@ -53,6 +54,32 @@ def extract_upload(data):
                     raise ValueError('DOCX expands beyond the permitted size.')
             doc = Document(io.BytesIO(content))
             text = '\n'.join([p.text for p in doc.paragraphs] + [' | '.join(c.text for c in row.cells) for table in doc.tables for row in table.rows])
+        elif suffix in ('.xlsx', '.xlsm', '.xltx'):
+            with zipfile.ZipFile(io.BytesIO(content)) as archive:
+                if sum(i.file_size for i in archive.infolist()) > 20 * 1024 * 1024:
+                    raise ValueError('Spreadsheet expands beyond the permitted size.')
+            wb = openpyxl.load_workbook(io.BytesIO(content), data_only=True, read_only=True)
+            try:
+                if len(wb.sheetnames) > 100:
+                    raise ValueError('Use a spreadsheet with at most 100 worksheets.')
+                parts, extracted = [], 0
+                for sheetname in wb.sheetnames:
+                    rows = []
+                    for row in wb[sheetname].iter_rows(values_only=True):
+                        if not any(c is not None and str(c).strip() for c in row):
+                            continue
+                        line = ' | '.join(str(c).strip() if c is not None else '' for c in row)
+                        extracted += len(line) + 1
+                        if extracted > MAX_TEXT:
+                            raise ValueError('Extracted text exceeds 120,000 characters. Split the spreadsheet.')
+                        rows.append(line)
+                    if rows:
+                        parts.append(f'[Sheet: {sheetname}]\n' + '\n'.join(rows))
+                text = '\n\n'.join(parts)
+            finally:
+                wb.close()
+        elif suffix == '.csv':
+            text = content.decode('utf-8-sig', errors='replace')
         else:
             text = content.decode('utf-8-sig')
             if suffix == '.json':
@@ -84,7 +111,7 @@ def chunks(text):
 
 
 def index_source(source, store, ai):
-    if source['customer'] != store.customer:
+    if source['customer'] != store.customer and store.customer not in ('My Workspace', 'All') and source['customer'] != 'General':
         raise ValueError('This source is outside the writable workspace.')
     pieces = chunks(source['content'])
     try:
@@ -107,7 +134,8 @@ def create_source(data, store, ai):
         if not isinstance(value, str) or len(value) > limit or (required and not value.strip()):
             raise ValueError(f'{key} must be text, up to {limit} characters' + (' and not empty.' if required else '.'))
         return value.strip()
-    if data.get('customer', store.customer) != store.customer:
+    target_customer = data.get('customer', store.customer)
+    if target_customer != store.customer and store.customer not in ('My Workspace', 'All') and target_customer != 'General':
         raise ValueError('Customer scope is not authorised.')
     content = text('content', MAX_TEXT)
     source_type = data.get('source_type', 'Document')
@@ -116,7 +144,7 @@ def create_source(data, store, ai):
     stamp = now()
     source = dict(id='SRC-' + uuid.uuid4().hex[:12].upper(), title=text('title', 200),
         content=content, application=text('application', 100), version=text('version', 100, False),
-        error_code=text('error_code', 100, False), customer=store.customer, source_type=source_type,
+        error_code=text('error_code', 100, False), customer=target_customer, source_type=source_type,
         filename=text('filename', 255, False), source_reference=text('source_reference', 1000, False),
         content_hash=hashlib.sha256(content.encode()).hexdigest(), validation='Unverified',
         validation_evidence={}, solution_kind='Unknown', solution='', steps=[], conflicts_with=[],

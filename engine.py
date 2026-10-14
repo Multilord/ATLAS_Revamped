@@ -25,6 +25,9 @@ def normalized(text):
 
 def retrieve(ticket, store, ai):
     started = time.monotonic()
+    # Search requires one query embedding plus one generation. Avoid a partial
+    # result when a constrained account has capacity for only one request.
+    ai.ensure_capacity(2)
     notes = [e['text'] for e in ticket.get('timeline', []) if e['kind'] in ('Note', 'Test', 'Communication', 'Attachment')][-15:]
     query = '\n'.join([ticket['title'], ticket['description'], ticket.get('error_code', ''), ticket.get('customisation', '')] + notes)[:16000]
     query_vector = ai.embed([query])[0]
@@ -88,6 +91,6 @@ def retrieve(ticket, store, ai):
     sufficient = any(r['confidence'] != 'Low' for r in recommendations)
     return dict(classification=result.classification, state='Evidence found' if sufficient else 'Insufficient evidence',
         summary=result.summary, next_steps=result.next_steps, results=recommendations,
-        engine=f'OpenAI {ai.config.model} + {ai.config.embedding_model}; hybrid retrieval',
+        engine=f'Gemini {ai.config.model} + {ai.config.embedding_model}; hybrid retrieval',
         model=ai.config.model, duration_seconds=round(time.monotonic() - started, 2),
         analysed_at=datetime.now(timezone.utc).isoformat(), evidence_count=len(evidence))

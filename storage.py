@@ -26,6 +26,8 @@ class MongoStore:
         self.client.admin.command('ping')
 
     def scope(self, kind):
+        if self.customer in ('My Workspace', 'All'):
+            return {}
         return {'customer': {'$in': [self.customer, 'General']}} if kind == 'source' else {'customer': self.customer}
 
     def collection(self, kind):
@@ -46,13 +48,17 @@ class MongoStore:
         return self.collection(kind).find_one({**self.scope(kind), 'id': id}, projection)
 
     def save(self, item, kind='investigation'):
-        if item.get('customer') != self.customer:
+        cust = item.get('customer')
+        if cust != self.customer and self.customer not in ('My Workspace', 'All') and cust != 'General':
             raise ValueError('Customer scope is not authorised for this write.')
         document = dict(item)
         expected = document.get('revision', 0)
         document['revision'] = expected + 1
         if expected:
-            result = self.collection(kind).replace_one({'id': item['id'], 'customer': self.customer, 'revision': expected}, document)
+            query = {'id': item['id'], 'revision': expected}
+            if self.customer not in ('My Workspace', 'All'):
+                query['customer'] = item.get('customer', self.customer)
+            result = self.collection(kind).replace_one(query, document)
             if result.matched_count != 1:
                 raise ConflictError('This record changed in another request. Reload and try again.')
         else:

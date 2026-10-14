@@ -1,8 +1,15 @@
-"""Real OpenAI requests with validated structured output and explicit errors."""
+"""Real Gemini requests with validated structured output and explicit errors."""
 import json
 import math
+import os
+import threading
+import time
+from datetime import datetime, timezone
+from pathlib import Path
 from typing import Literal
-from openai import OpenAI, APIError, AuthenticationError, RateLimitError, APITimeoutError, APIConnectionError
+import httpx
+from google import genai
+from google.genai import errors, types
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 
@@ -10,8 +17,90 @@ class AIError(Exception):
     pass
 
 
+class GeminiQuota:
+    """Persistent, process-safe-enough guard for this single local server."""
+    def __init__(self, per_minute, per_day, path=None, clock=time.time):
+        if per_minute < 1 or per_day < 1:
+            raise ValueError('Gemini request limits must be positive integers.')
+        self.per_minute, self.per_day = per_minute, per_day
+        self.path = Path(path or Path(__file__).resolve().parent / 'data' / 'gemini-quota.json')
+        self.clock, self.lock = clock, threading.Lock()
+
+    def _load(self):
+        try:
+            data = json.loads(self.path.read_text(encoding='utf-8'))
+            return [float(value) for value in data.get('requests', [])]
+        except (FileNotFoundError, ValueError, TypeError, OSError):
+            return []
+
+    def _current(self, now):
+        today = datetime.fromtimestamp(now, timezone.utc).date()
+        return [stamp for stamp in self._load()
+            if datetime.fromtimestamp(stamp, timezone.utc).date() == today]
+
+    def _save(self, requests):
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        temporary = self.path.with_suffix('.tmp')
+        temporary.write_text(json.dumps({'requests': requests}), encoding='utf-8')
+        os.replace(temporary, self.path)
+
+    def status(self, needed=0):
+        with self.lock:
+            now = self.clock()
+            daily = self._current(now)
+            minute = [stamp for stamp in daily if now - stamp < 60]
+            retry = max(0, math.ceil(60 - (now - min(minute)))) if minute else 0
+            return dict(per_minute=self.per_minute, per_day=self.per_day,
+                minute_used=len(minute), minute_remaining=max(0, self.per_minute-len(minute)),
+                daily_used=len(daily), daily_remaining=max(0, self.per_day-len(daily)),
+                retry_after_seconds=retry if len(minute) + needed > self.per_minute else 0,
+                timezone='UTC', locally_tracked=True)
+
+    def ensure(self, needed=1):
+        status = self.status(needed)
+        if status['daily_remaining'] < needed:
+            raise AIError(f'ATLAS has reached its local Gemini daily limit ({self.per_day} requests, UTC). Try again after the daily reset.')
+        if status['minute_remaining'] < needed:
+            raise AIError(f'ATLAS needs {needed} Gemini request(s), but only {status["minute_remaining"]} remain in the local 60-second window. Retry in about {status["retry_after_seconds"]} seconds.')
+        return status
+
+    def acquire(self):
+        with self.lock:
+            now = self.clock()
+            daily = self._current(now)
+            minute = [stamp for stamp in daily if now - stamp < 60]
+            if len(daily) >= self.per_day:
+                raise AIError(f'ATLAS has reached its local Gemini daily limit ({self.per_day} requests, UTC). Try again after the daily reset.')
+            if len(minute) >= self.per_minute:
+                retry = max(1, math.ceil(60 - (now - min(minute))))
+                raise AIError(f'ATLAS has reached its local Gemini rate limit ({self.per_minute} requests per minute). Retry in about {retry} seconds.')
+            daily.append(now)
+            self._save(daily)
+
+
+def provider_schema(schema):
+    """Describe the response shape; enforce size bounds with Pydantic."""
+    def simplify(value):
+        if isinstance(value, list):
+            return [simplify(item) for item in value]
+        if not isinstance(value, dict):
+            return value
+        result = {}
+        for key, item in value.items():
+            if key in ('properties', '$defs'):
+                result[key] = {name: simplify(definition) for name, definition in item.items()}
+            elif key not in ('minLength', 'maxLength', 'minItems', 'maxItems'):
+                result[key] = simplify(item)
+        return result
+    return simplify(schema.model_json_schema())
+
+
 class StrictModel(BaseModel):
     model_config = ConfigDict(extra='forbid')
+
+
+class ConnectionProbe(StrictModel):
+    status: Literal['ok']
 
 
 class Communication(StrictModel):
@@ -67,8 +156,9 @@ ticket resolved or authorise production changes. Return a concise assessment, no
 
 
 class AIService:
-    def __init__(self, config, client=None):
+    def __init__(self, config, client=None, quota=None):
         self.config, self._client = config, client
+        self.quota = quota if quota is not None else (None if client is not None else GeminiQuota(config.gemini_rpm, config.gemini_rpd))
 
     @property
     def configured(self):
@@ -77,32 +167,62 @@ class AIService:
     @property
     def client(self):
         if not self.configured:
-            raise AIError('Add OPENAI_API_KEY to .env and restart the server to enable AI.')
+            raise AIError('Add GEMINI_API_KEY to .env and restart the server to enable AI.')
         if self._client is None:
-            self._client = OpenAI(api_key=self.config.api_key, timeout=self.config.ai_timeout, max_retries=1)
+            self._client = genai.Client(api_key=self.config.api_key, vertexai=False,
+                http_options=types.HttpOptions(timeout=self.config.ai_timeout * 1000,
+                    retry_options=types.HttpRetryOptions(attempts=1)))
         return self._client
 
-    def _call(self, function):
+    def quota_status(self):
+        return self.quota.status() if self.quota else dict(per_minute=self.config.gemini_rpm,
+            per_day=self.config.gemini_rpd, minute_used=0, minute_remaining=self.config.gemini_rpm,
+            daily_used=0, daily_remaining=self.config.gemini_rpd, retry_after_seconds=0,
+            timezone='UTC', locally_tracked=False)
+
+    def ensure_capacity(self, needed=1):
+        if self.quota:
+            self.quota.ensure(needed)
+
+    def _call(self, function, remote=True):
+        if remote:
+            if not self.configured:
+                raise AIError('Add GEMINI_API_KEY to .env and restart the server to enable AI.')
+            if self.quota:
+                self.quota.acquire()
         try:
             return function()
-        except AuthenticationError:
-            raise AIError('OpenAI rejected the API key. Update OPENAI_API_KEY and restart.') from None
-        except RateLimitError:
-            raise AIError('OpenAI quota or rate limit reached. Check billing and retry later.') from None
-        except (APITimeoutError, APIConnectionError):
-            raise AIError('OpenAI could not be reached. Check your network and retry.') from None
-        except APIError:
-            raise AIError('OpenAI request failed. Check configured model access and retry. No generated result was saved.') from None
+        except errors.APIError as exc:
+            if exc.code in (401, 403):
+                message = 'Gemini rejected the API key or model access. Check GEMINI_API_KEY and configured models, then restart.'
+            elif exc.code == 429:
+                message = 'Gemini quota or rate limit reached. Check your Google AI Studio quota and retry later.'
+            elif exc.code in (500, 502, 503, 504):
+                message = f'Gemini model {self.config.model} is temporarily unavailable or busy (HTTP {exc.code}). Retry later. After changing GEMINI_MODEL in .env, restart ATLAS. No generated result was saved.'
+            elif exc.code == 400:
+                message = f'Gemini rejected the request format for {self.config.model} (HTTP 400). Check model compatibility and request limits. No generated result was saved.'
+            else:
+                message = 'Gemini request failed. Check your API key and configured model access, then retry. No generated result was saved.'
+            raise AIError(message) from None
+        except httpx.TransportError:
+            raise AIError('Gemini could not be reached. Check your network and retry.') from None
         except (ValidationError, json.JSONDecodeError):
             raise AIError('The AI response failed schema validation. No generated result was saved; retry.') from None
 
     def structured(self, schema, instruction, payload):
-        response = self._call(lambda: self.client.responses.parse(model=self.config.model, store=False,
-            input=[{'role': 'system', 'content': instruction}, {'role': 'user', 'content': json.dumps(payload, ensure_ascii=False)}],
-            text_format=schema, max_output_tokens=6000))
-        if response.status != 'completed' or response.output_parsed is None:
+        # Gemini's constrained decoder rejects large/nested size limits on some
+        # models. JSON mode avoids that grammar; Pydantic still validates every
+        # field, bound and enum before any generated result can be persisted.
+        instruction += '\nReturn only one JSON object matching this schema:\n' + json.dumps(provider_schema(schema))
+        response = self._call(lambda: self.client.models.generate_content(model=self.config.model,
+            contents=json.dumps(payload, ensure_ascii=False),
+            config=types.GenerateContentConfig(system_instruction=instruction,
+                response_mime_type='application/json',
+                thinking_config=types.ThinkingConfig(thinking_budget=0) if self.config.model.startswith('gemini-2.5-flash') else None,
+                max_output_tokens=6000)))
+        if not response.candidates or response.candidates[0].finish_reason != types.FinishReason.STOP or not response.text:
             raise AIError('The AI response was incomplete or refused. No generated result was saved.')
-        return response.output_parsed
+        return self._call(lambda: schema.model_validate_json(response.text), remote=False)
 
     def extract(self, text):
         return self.structured(TicketExtraction,
@@ -113,23 +233,26 @@ class AIService:
             'retain the communications in description. Do not invent a resolution.', {'ticket_text': text}).model_dump()
 
     def embed(self, texts):
+        self.ensure_capacity(math.ceil(len(texts) / 16))
         vectors = []
         for start in range(0, len(texts), 16):
             batch = texts[start:start + 16]
-            response = self._call(lambda: self.client.embeddings.create(model=self.config.embedding_model, input=batch, encoding_format='float'))
-            rows = sorted(response.data, key=lambda row: row.index)
-            if [row.index for row in rows] != list(range(len(batch))):
+            # Explicit Content objects ensure one vector per text with Gemini Embedding 2.
+            contents = [types.Content(parts=[types.Part.from_text(text=text)]) for text in batch]
+            response = self._call(lambda: self.client.models.embed_content(model=self.config.embedding_model, contents=contents))
+            rows = response.embeddings or []
+            if len(rows) != len(batch):
                 raise AIError('Embedding response did not match the submitted content.')
             for row in rows:
-                if not row.embedding or any(not math.isfinite(x) for x in row.embedding):
+                if not row.values or any(not math.isfinite(x) for x in row.values):
                     raise AIError('Invalid embedding response.')
-                vectors.append(row.embedding)
+                vectors.append(row.values)
         return vectors
 
     def investigate(self, ticket, evidence):
         return self.structured(InvestigationResponse, SYSTEM, {'ticket': ticket, 'evidence': evidence})
 
     def check(self):
-        self._call(lambda: self.client.models.retrieve(self.config.model))
-        self._call(lambda: self.client.models.retrieve(self.config.embedding_model))
+        self.ensure_capacity(1)
+        self.structured(ConnectionProbe, 'Connection check. Return {"status":"ok"}.', {})
         return {'status': 'Connected', 'model': self.config.model, 'embedding_model': self.config.embedding_model}
