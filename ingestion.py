@@ -11,6 +11,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from pypdf import PdfReader
 from docx import Document
+from docx.text.paragraph import Paragraph
+from docx.table import Table
 import openpyxl
 from ai import AIError
 
@@ -53,7 +55,18 @@ def extract_upload(data):
                 if sum(i.file_size for i in archive.infolist()) > 20 * 1024 * 1024:
                     raise ValueError('DOCX expands beyond the permitted size.')
             doc = Document(io.BytesIO(content))
-            text = '\n'.join([p.text for p in doc.paragraphs] + [' | '.join(c.text for c in row.cells) for table in doc.tables for row in table.rows])
+            parts = []
+            for element in doc.element.body:
+                if element.tag.endswith('}p'):
+                    paragraph = Paragraph(element, doc)
+                    value = paragraph.text.strip()
+                    if value:
+                        style = paragraph.style.name if paragraph.style else ''
+                        parts.append(('[Section: ' + value + ']') if style.startswith('Heading') else value)
+                elif element.tag.endswith('}tbl'):
+                    table = Table(element, doc)
+                    parts.append('[Table]\n' + '\n'.join(' | '.join(c.text for c in row.cells) for row in table.rows))
+            text = '\n\n'.join(parts)
         elif suffix in ('.xlsx', '.xlsm', '.xltx'):
             with zipfile.ZipFile(io.BytesIO(content)) as archive:
                 if sum(i.file_size for i in archive.infolist()) > 20 * 1024 * 1024:
@@ -94,25 +107,32 @@ def extract_upload(data):
 
 
 def chunks(text):
-    output, start = [], 0
-    while start < len(text):
-        end = min(start + 2200, len(text))
-        if end < len(text):
-            boundary = text.rfind('\n', start + 1600, end)
-            if boundary != -1:
-                end = boundary
-        piece = text[start:end].strip()
-        if piece:
-            output.append({'id': f'C{len(output)+1:04}', 'text': piece, 'offset': start})
-        if end == len(text):
-            break
-        start = end - 200
+    output = []
+    boundaries = [m.start() for m in re.finditer(r'^\[Section: .+\]$', text, re.M)]
+    boundaries = sorted(set([0] + boundaries + [len(text)]))
+    for left, right in zip(boundaries, boundaries[1:]):
+        start = left
+        section = text[left:text.find('\n', left) if '\n' in text[left:right] else right] if text[left:].startswith('[Section: ') else ''
+        while start < right:
+            end = min(start + 2200, right)
+            if end < right:
+                boundary = text.rfind('\n', start + 1600, end)
+                if boundary != -1:
+                    end = boundary
+            piece = text[start:end].strip()
+            if piece:
+                output.append({'id': f'C{len(output)+1:04}', 'text': piece, 'offset': start, 'section': section})
+            if end == right:
+                break
+            start = end - 200
     return output
 
 
 def index_source(source, store, ai):
     if source['customer'] != store.customer and store.customer not in ('My Workspace', 'All') and source['customer'] != 'General':
         raise ValueError('This source is outside the writable workspace.')
+    if source.get('index_status') == 'Ready' and source.get('embedding_model') == ai.config.embedding_model:
+        return {k: v for k, v in source.items() if k != 'chunks'}
     pieces = chunks(source['content'])
     try:
         vectors = ai.embed([source['title'] + '\n' + part['text'] for part in pieces])
@@ -135,6 +155,10 @@ def create_source(data, store, ai):
             raise ValueError(f'{key} must be text, up to {limit} characters' + (' and not empty.' if required else '.'))
         return value.strip()
     target_customer = data.get('customer', store.customer)
+    if not isinstance(target_customer, str) or not target_customer.strip() or len(target_customer) > 200:
+        raise ValueError('Customer must be non-empty text, up to 200 characters.')
+    if not isinstance(data.get('index_now', False), bool):
+        raise ValueError('index_now must be true or false.')
     if target_customer != store.customer and store.customer not in ('My Workspace', 'All') and target_customer != 'General':
         raise ValueError('Customer scope is not authorised.')
     content = text('content', MAX_TEXT)
@@ -145,10 +169,11 @@ def create_source(data, store, ai):
     source = dict(id='SRC-' + uuid.uuid4().hex[:12].upper(), title=text('title', 200),
         content=content, application=text('application', 100), version=text('version', 100, False),
         error_code=text('error_code', 100, False), customer=target_customer, source_type=source_type,
+        document_version=text('document_version', 100, False), source_section=text('source_section', 300, False),
         filename=text('filename', 255, False), source_reference=text('source_reference', 1000, False),
         content_hash=hashlib.sha256(content.encode()).hexdigest(), validation='Unverified',
         validation_evidence={}, solution_kind='Unknown', solution='', steps=[], conflicts_with=[],
         created_at=stamp, updated_at=stamp, index_status='Pending', index_error='', chunk_count=0,
         chunks=[], embedding_model='', revision=0)
     store.save(source, 'source')
-    return index_source(source, store, ai)
+    return index_source(source, store, ai) if data.get('index_now', False) else {k: v for k, v in source.items() if k != 'chunks'}

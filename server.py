@@ -13,7 +13,8 @@ from pymongo.errors import PyMongoError
 from config import settings
 from storage import MongoStore, ConflictError
 from ai import AIService, AIError
-from engine import retrieve
+from engine import retrieve, tokens
+from workflow import update_workspace, validate_closure
 from ingestion import create_source, index_source, extract_upload
 
 ROOT = Path(__file__).resolve().parent
@@ -63,6 +64,24 @@ def required_text(data, key, limit=12000):
     return value.strip()
 
 
+ITIL_TEXT_FIELDS = ('platform', 'module', 'component', 'scenario_group', 'clarification',
+    'investigation_notes', 'functional_solutioning', 'technical_solutioning', 'change_stages',
+    'verification', 'lifecycle_path', 'root_cause', 'sources', 'linked_ticket_ids')
+
+
+def itil_context(data):
+    context = data.get('itil', {})
+    if not isinstance(context, dict):
+        raise ValueError('ITIL context must be an object.')
+    result = {}
+    for key in ITIL_TEXT_FIELDS:
+        value = context.get(key, data.get(key, ''))
+        if not isinstance(value, str) or len(value) > 12000:
+            raise ValueError('Invalid ITIL field: ' + key)
+        result[key] = value.strip()
+    return result
+
+
 def parse_intake(data, use_ai=False):
     raw = required_text(data, 'content', 100000)
     filename = data.get('filename', '')
@@ -78,6 +97,14 @@ def parse_intake(data, use_ai=False):
             raise ValueError('Invalid JSON. Check the ticket export and try again.')
         if not isinstance(obj, dict):
             raise ValueError('Ticket JSON must be an object.')
+        # Accept the client's ticket column names in a single-ticket JSON export.
+        for target, original in [('description', 'problem_statement'), ('version', 'release'), ('error_code', 'error_message'), ('type', 'ticket_type')]:
+            if target not in obj and original in obj:
+                obj[target] = obj[original]
+        if 'application' not in obj and obj.get('module') and obj.get('platform'):
+            obj['application'] = str(obj['module']) + ' (' + str(obj['platform']) + ')'
+        if isinstance(obj.get('type'), str):
+            obj['type'] = next((kind for kind in TYPES if kind.casefold() == obj['type'].casefold()), obj['type'])
         for key in ('title', 'description', 'application', 'version', 'ticket_id', 'error_code', 'customisation', 'type', 'priority'):
             if key in obj and not isinstance(obj[key], str):
                 raise ValueError(f'{key} must be text.')
@@ -108,14 +135,17 @@ def parse_intake(data, use_ai=False):
     if len(description) > 12000:
         raise ValueError('Description exceeds 12,000 characters. Split communications into a JSON timeline.')
     error = re.search(r'\b(?:[A-Z][0-9]\s?\d{3}|Z[A-Z]+_\d+|AUTH_\d+|HTTP\s\d+)\b', description)
-    return dict(title=obj.get('title', next((line for line in raw.splitlines() if line.strip()), '')[:120]), description=description[:12000], ticket_id=obj.get('ticket_id', ''), application=obj.get('application', 'SAP Finance' if re.search('invoice|vendor|payment', description, re.I) else 'SAP Procurement' if re.search('purchase|approval', description, re.I) else ''), version=obj.get('version', ''), error_code=obj.get('error_code', error.group() if error else ''), customisation=obj.get('customisation', ''), type=obj.get('type', 'Incident'), priority=obj.get('priority', 'Medium'), customer=CUSTOMER, timeline=cleaned, filename=filename)
+    return dict(title=obj.get('title', next((line for line in raw.splitlines() if line.strip()), '')[:120]), description=description[:12000], ticket_id=obj.get('ticket_id', ''), application=obj.get('application', 'SAP Finance' if re.search('invoice|vendor|payment', description, re.I) else 'SAP Procurement' if re.search('purchase|approval', description, re.I) else ''), version=obj.get('version', ''), error_code=obj.get('error_code', error.group() if error else ''), customisation=obj.get('customisation', ''), type=obj.get('type', 'Incident'), priority=obj.get('priority', 'Medium'), customer=obj.get('customer', CUSTOMER), timeline=cleaned, filename=filename, itil=itil_context(obj))
 
 
 def create_investigation(data):
     target_customer = data.get('customer', CUSTOMER)
+    if not isinstance(target_customer, str) or not target_customer.strip() or len(target_customer) > 200:
+        raise ValueError('Customer must be non-empty text, up to 200 characters.')
     if target_customer != CUSTOMER and CUSTOMER not in ('My Workspace', 'All'):
         raise ValueError('Customer scope is not authorised.')
     item = {key: required_text(data, key, size) for key, size in [('title', 200), ('description', 12000), ('application', 100), ('version', 100)]}
+    item['itil'] = itil_context(data)
     for key in ('ticket_id', 'error_code', 'customisation'):
         val = data.get(key, '')
         if not isinstance(val, str) or len(val) > 500:
@@ -160,7 +190,7 @@ def update_investigation(item, action, data):
         item['status'] = 'Awaiting validation' if item['selected_source'] else 'In progress'
         message = data['decision'] + ' recommendation ' + source_id + '.'
     elif action == 'note':
-        if data.get('kind') not in ('Note', 'Test', 'Attachment'):
+        if data.get('kind') not in ('Note', 'Test', 'Attachment', 'Acceptance', 'Acknowledgment', 'Clarification', 'Investigation', 'Functional solutioning', 'Technical solutioning', 'Approval', 'Development', 'Deployment', 'Verification'):
             raise ValueError('Invalid note type.')
         message = required_text(data, 'text')
         if item.get('analysis') and not item.get('outcome'):
@@ -168,12 +198,18 @@ def update_investigation(item, action, data):
             item['decisions'] = {}
             item['selected_source'] = None
             item['status'] = 'In progress'
+    elif action == 'workspace':
+        message = update_workspace(item, data, store, now(), settings.consultant)
+        if not item.get('outcome') and data.get('kind') in ('context', 'requirement', 'proposal', 'scenario'):
+            item.update(analysis=None, decisions={}, selected_source=None)
     elif action == 'outcome':
         if item.get('outcome'):
             raise ValueError('An outcome has already been recorded.')
         status = data.get('status')
         if status not in OUTCOMES:
             raise ValueError('Select a valid outcome.')
+        if status == 'Resolved':
+            validate_closure(item)
         notes = required_text(data, 'notes')
         flags = ('tested', 'customer_confirmed', 'approved', 'developed', 'deployed', 'verified')
         if any(k in data and not isinstance(data[k], bool) for k in flags):
@@ -252,7 +288,7 @@ class Handler(BaseHTTPRequestHandler):
             if path == '/api/extract':
                 return self.respond(200, extract_upload(data))
             if path == '/api/intake':
-                return self.respond(200, parse_intake(data, use_ai=True))
+                return self.respond(200, parse_intake(data, use_ai=data.get('use_ai') is True))
             if path == '/api/sources':
                 return self.respond(201, create_source(data, store, ai))
             source_match = re.fullmatch(r'/api/sources/([A-Za-z0-9-]+)/(reindex|review)', path)
@@ -277,11 +313,23 @@ class Handler(BaseHTTPRequestHandler):
                 return self.respond(200, {k: v for k, v in source.items() if k != 'chunks'})
             if path == '/api/investigations':
                 return self.respond(201, create_investigation(data))
-            match = re.fullmatch(r'/api/investigations/([A-Za-z0-9-]+)/(analyze|decision|note|outcome)', path)
+            match = re.fullmatch(r'/api/investigations/([A-Za-z0-9-]+)/(analyze|decision|note|outcome|workspace|search)', path)
             if match:
                 item = get_record(match[1], 'investigation')
                 if not item:
                     return self.respond(404, {'error': 'Investigation not found.'})
+                if match[2] == 'search':
+                    query = tokens(required_text(data, 'query', 500))
+                    results = []
+                    for source in store.records('source'):
+                        if source['customer'] not in (item['customer'], 'General'):
+                            continue
+                        score = len(query & tokens(source['title'] + ' ' + source['content']))
+                        if score:
+                            paragraphs = source['content'].split('\n')
+                            excerpt = max(paragraphs, key=lambda p: len(query & tokens(p)))[:1500]
+                            results.append(dict(source_id=source['id'], title=source['title'], excerpt=excerpt, score=score, validation=source['validation']))
+                    return self.respond(200, dict(results=sorted(results, key=lambda r: r['score'], reverse=True)[:10]))
                 return self.respond(200, update_investigation(item, match[2], data))
             return self.respond(404, {'error': 'Not found.'})
         except (ValueError, TypeError, AttributeError) as exc:

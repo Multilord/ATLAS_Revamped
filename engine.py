@@ -28,7 +28,7 @@ def retrieve(ticket, store, ai):
     # Search requires one query embedding plus one generation. Avoid a partial
     # result when a constrained account has capacity for only one request.
     ai.ensure_capacity(2)
-    notes = [e['text'] for e in ticket.get('timeline', []) if e['kind'] in ('Note', 'Test', 'Communication', 'Attachment')][-15:]
+    notes = [e['text'] for e in ticket.get('timeline', []) if e['kind'] in ('Note', 'Test', 'Communication', 'Attachment', 'Clarification', 'Investigation', 'Functional solutioning', 'Technical solutioning', 'Verification')][-15:]
     query = '\n'.join([ticket['title'], ticket['description'], ticket.get('error_code', ''), ticket.get('customisation', '')] + notes)[:16000]
     query_vector = ai.embed([query])[0]
     query_tokens = tokens(query)
@@ -44,6 +44,9 @@ def retrieve(ticket, store, ai):
         same_app = normalized(source['application']) == normalized(ticket['application'])
         same_version = bool(source.get('version')) and normalized(source['version']) == normalized(ticket['version'])
         score = .6 * max(0, similarity) + .2 * overlap + .1 * exact + .05 * same_app + .05 * same_version
+        quality = source.get('itil', {}).get('resolution_quality')
+        if quality in ('Unverified', 'Workaround only'):
+            score *= .4 if quality == 'Unverified' else .65
         candidates.append((score, source, chunk, same_app, same_version))
     candidates.sort(key=lambda c: c[0], reverse=True)
     selected, per_source = [], {}
@@ -55,8 +58,8 @@ def retrieve(ticket, store, ai):
         per_source[id] = per_source.get(id, 0) + 1
         if len(selected) == 10:
             break
-    evidence = [{'source_id': s['id'], 'chunk_id': c['id'], 'title': s['title'], 'application': s['application'], 'version': s['version'], 'updated_at': s['updated_at'], 'validation': s['validation'], 'text': c['text']} for _, s, c, _, _ in selected]
-    result = ai.investigate({k: ticket.get(k, '') for k in ('title', 'description', 'application', 'version', 'error_code', 'customisation', 'type')} | {'recent_notes': [n[:2000] for n in notes]}, evidence)
+    evidence = [{'source_id': s['id'], 'chunk_id': c['id'], 'title': s['title'], 'application': s['application'], 'version': s['version'], 'updated_at': s['updated_at'], 'validation': s['validation'], 'resolution_quality': s.get('itil', {}).get('resolution_quality', ''), 'solution_kind': s.get('solution_kind', ''), 'text': c['text']} for _, s, c, _, _ in selected]
+    result = ai.investigate({k: ticket.get(k, '') for k in ('title', 'description', 'application', 'version', 'error_code', 'customisation', 'type')} | {'recent_notes': [n[:2000] for n in notes], 'itil_context': ticket.get('itil', {}), 'consultant_workspace': {k: ticket.get('workflow', {}).get(k, []) for k in ('requirements', 'proposals', 'scenarios')}}, evidence)
     lookup = {(s['id'], c['id']): (score, s, c, app, version) for score, s, c, app, version in selected}
     recommendations, seen = [], set()
     for recommendation in result.recommendations:
@@ -70,6 +73,8 @@ def retrieve(ticket, store, ai):
             continue
         seen.add(source['id'])
         warnings = list(recommendation.warnings)
+        if source.get('itil', {}).get('resolution_quality') in ('Unverified', 'Workaround only'):
+            warnings.append('Historical closure is unverified or a workaround. Establish the root cause before reuse.')
         if not same_app:
             warnings.append('Application differs or is unspecified. Confirm applicability.')
         if not same_version:
@@ -79,6 +84,8 @@ def retrieve(ticket, store, ai):
             warnings.append('This source may be outdated. Validate against the current environment.')
         verified = source['validation'] == 'Verified' and all(source.get('validation_evidence', {}).get(k) for k in ('tested', 'customer_confirmed', 'deployed'))
         confidence = recommendation.confidence
+        if source.get('itil', {}).get('resolution_quality') == 'Unverified':
+            confidence = 'Low'
         if not same_app or not same_version or age > 540 or source['validation'] == 'Outdated':
             confidence = 'Low'
         elif confidence == 'High' and (not verified or warnings):

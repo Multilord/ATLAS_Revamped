@@ -44,16 +44,18 @@ Open http://127.0.0.1:8000. On this development machine a portable MongoDB was d
 
 1. Click **Check AI connection** to test one small live generation request. The dashboard shows the active generation model and ATLAS's locally tracked quota balance. After changing `.env`, restart the Python server; refreshing the browser alone does not reload configuration.
 2. In **Knowledge**, upload actual documents or paste text. TXT, MD, JSON, text-based PDF, DOCX, XLSX/XLSM/XLTX and CSV are supported, up to 5 MB. Review application, version and source reference before saving.
-3. Sources are stored in MongoDB and embedded. Failed indexing retains the document with an error and retry action. Only Ready sources with the configured embedding model are searched.
-4. Create an investigation from actual ticket text or a document. Review AI-extracted context before saving. Manual entry and structured JSON intake also work without a key.
+3. Sources are saved without AI requests. Use Index / reindex explicitly when approved and ready. Failed indexing retains the document with an error and retry action. AI retrieval searches only Ready sources; local keyword search also searches Pending sources.
+4. Create an investigation from actual ticket text or a document. Local parsing uses no AI request. Review and complete the context before saving.
 5. Run analysis. Gemini synthesizes recommendations from retrieved chunks. Every recommendation must cite a supplied source and an exact quote; invalid citations reject the response. Insufficient evidence produces diagnostic next steps.
-6. Record evidence, decisions and validated outcomes. Promote outcomes to knowledge by reviewing and saving the draft. Verification requires recorded testing, customer confirmation and deployment evidence.
+6. Use **Solution workspace** to record requirements, functional/technical proposals, stage owners and verification scenarios without AI. Record evidence, decisions and validated outcomes. Promote outcomes to knowledge by reviewing and saving the draft. Verification requires recorded testing, customer confirmation and deployment evidence.
 
 Ticket and document text used for extraction, embedding and analysis is sent to Gemini. Provider failures are explicit, with no simulated fallback. Changing embedding model requires reindexing.
 
 ATLAS defaults to a local guard of 5 requests per rolling 60 seconds and 20 requests per UTC day. It persists counts in ignored local application data, preflights two-request analysis operations, and prevents ATLAS from exceeding those configured limits. The counter only observes requests made by this ATLAS installation; requests made in AI Studio or other applications can make Gemini reject a call before the local counter reaches zero. A connection check costs one request, ticket extraction costs one, indexing costs one request per batch of up to 16 chunks, and evidence analysis costs two.
 
 ## Verification
+
+For the client ITIL CSV structure, dataset replacement, backups and batched indexing, see [Client ticket import](docs/CLIENT_TICKET_IMPORT.md). The importer is explicit; startup never seeds records automatically.
 
 ```powershell
 .\.venv\Scripts\python.exe -m pip install -r requirements-dev.txt
@@ -73,3 +75,5 @@ Functional local, single-workspace application bound to loopback. SSO, roles, do
 The former SQLite database is unused and not imported automatically; ignored files are preserved. Uploaded sources begin Unverified. Upload time does not establish the original guidance's freshness.
 
 server.py provides the API and workflow; storage.py handles scoped MongoDB persistence and optimistic concurrency; ai.py calls Gemini; ingestion.py extracts and indexes documents; engine.py retrieves and validates evidence; static/ contains the UI.
+
+For the NTT workflow implementation, review gates and remaining deployment prerequisites, see [NTT workflow](docs/NTT_WORKFLOW.md).

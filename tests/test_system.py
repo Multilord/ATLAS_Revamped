@@ -38,7 +38,7 @@ def response(recommendations=None):
 
 
 def source_data():
-    return dict(title='Test maintenance procedure', content='Inspect the connection configuration and validate the correction in quality.', application='Test App', version='1.0', source_type='Internal KB')
+    return dict(title='Test maintenance procedure', content='Inspect the connection configuration and validate the correction in quality.', application='Test App', version='1.0', source_type='Internal KB', index_now=True)
 
 
 class StoreCase(unittest.TestCase):
@@ -204,6 +204,20 @@ class WorkflowTests(StoreCase):
     def test_other_customer_intake_rejected(self):
         with self.assertRaises(ValueError):
             server.parse_intake(dict(content=json.dumps({'customer':'Other Customer'})))
+
+    def test_client_itil_intake_and_stage_notes(self):
+        data=dict(title='New change',problem_statement='Batch requirement',ticket_type='Change Request',
+            release='2023',module='PP',platform='S/4HANA',priority='High',clarification='Plant scope agreed')
+        parsed=server.parse_intake({'content':json.dumps(data)})
+        self.assertEqual(parsed['type'],'Change request')
+        ticket=server.create_investigation(parsed)
+        self.assertEqual(ticket['itil']['clarification'],'Plant scope agreed')
+        ticket=server.update_investigation(ticket,'note',{'kind':'Functional solutioning','text':'Review the selection strategy.'})
+        self.assertEqual(ticket['timeline'][-1]['kind'],'Functional solutioning')
+
+    def test_invalid_itil_context_rejected(self):
+        with self.assertRaisesRegex(ValueError,'ITIL'):
+            server.create_investigation(dict(title='Case',description='Issue',application='App',version='1',type='Incident',priority='Low',itil=[]))
 
 
 class FileTests(unittest.TestCase):

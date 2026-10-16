@@ -152,7 +152,12 @@ Every recommendation must cite a supplied source_id and chunk_id and quote a ver
 supporting passage (at least 15 characters). Procedure steps must be supported by that
 passage or clearly phrased as validation of the cited procedure. Prefer current guidance,
 explain conflicts and keep mismatched versions low confidence. Never declare the current
-ticket resolved or authorise production changes. Return a concise assessment, not private reasoning.'''
+ticket resolved or authorise production changes. Respect ITIL ticket type: service requests
+need fulfilment and verification; incidents need diagnosis and restoration; change requests
+need clarification, functional and technical solutioning, approval, development, deployment
+and verification. Distinguish workaround-only and unverified closures from confirmed fixes.
+Imported reference names are provenance, not proof that those external pages were checked.
+Return a concise assessment, not private reasoning.'''
 
 
 class AIService:
@@ -174,8 +179,8 @@ class AIService:
                     retry_options=types.HttpRetryOptions(attempts=1)))
         return self._client
 
-    def quota_status(self):
-        return self.quota.status() if self.quota else dict(per_minute=self.config.gemini_rpm,
+    def quota_status(self, needed=0):
+        return self.quota.status(needed) if self.quota else dict(per_minute=self.config.gemini_rpm,
             per_day=self.config.gemini_rpd, minute_used=0, minute_remaining=self.config.gemini_rpm,
             daily_used=0, daily_remaining=self.config.gemini_rpd, retry_after_seconds=0,
             timezone='UTC', locally_tracked=False)
