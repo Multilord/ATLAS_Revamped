@@ -8,6 +8,7 @@ import threading
 import tempfile
 import unittest
 import uuid
+import zipfile
 from dataclasses import replace
 from datetime import datetime, timezone
 from urllib.error import HTTPError
@@ -25,7 +26,7 @@ import server
 from config import Settings
 from storage import MongoStore, ConflictError
 from ai import AIService, AIError, GeminiQuota, InvestigationResponse
-from engine import retrieve
+from engine import retrieve, rank_candidates, conflicting_sources
 from ingestion import create_source, extract_upload, chunks, index_source
 
 
@@ -76,7 +77,9 @@ class DatabaseTests(StoreCase):
 
     def test_scoped_reads_and_writes(self):
         self.store.db.sources.insert_one(dict(id='private',customer='Other Customer',content='secret',index_status='Ready',embedding_model=self.cfg.embedding_model,chunks=[{'id':'C1','text':'secret','embedding':[1,0,0]}]))
+        self.store.db.sources.insert_one(dict(id='legacy-general',customer='General',content='possibly unreviewed',index_status='Ready',embedding_model=self.cfg.embedding_model,chunks=[{'id':'C2','text':'possibly unreviewed','embedding':[1,0,0]}]))
         self.assertIsNone(self.store.get('private','source'))
+        self.assertIsNone(self.store.get('legacy-general','source'))
         self.assertEqual(list(self.store.indexed_chunks(self.cfg.embedding_model)),[])
         with self.assertRaises(ValueError):
             self.store.save(dict(id='bad',customer='Other Customer'))
@@ -105,6 +108,25 @@ class DatabaseTests(StoreCase):
         self.source()
         self.assertEqual(list(self.store.indexed_chunks('different-model')),[])
 
+    def test_general_sources_require_explicit_generalization(self):
+        data=source_data() | dict(customer='General')
+        with self.assertRaisesRegex(ValueError,'removed before sharing'):
+            create_source(data,self.store,self.ai)
+        data['generalized_confirmed']=True
+        source=create_source(data,self.store,self.ai)
+        self.assertEqual(source['customer'],'General')
+        self.assertTrue(source['generalization_confirmed'])
+
+    def test_outcome_signals_require_validation_not_just_resolved_status(self):
+        source=self.source()
+        self.store.db.investigations.insert_many([
+            dict(id='good',customer=self.cfg.customer,selected_source=source['id'],type='Incident',outcome=dict(status='Resolved',tested=True,customer_confirmed=True)),
+            dict(id='closed',customer=self.cfg.customer,selected_source=source['id'],type='Incident',outcome=dict(status='Closed - other',tested=True,customer_confirmed=True)),
+            dict(id='bad',customer=self.cfg.customer,selected_source=source['id'],type='Incident',outcome=dict(status='Unresolved')),
+        ])
+        self.assertEqual(self.store.outcome_signals([source['id']])[source['id']],
+            dict(validated_successes=1,unsuccessful=1,workarounds=0,partly_useful=0))
+
 
 class AIGroundingTests(StoreCase):
     def test_analysis_uses_actual_ai_result_and_quote(self):
@@ -114,6 +136,8 @@ class AIGroundingTests(StoreCase):
         self.assertEqual(result['results'][0]['quote'],source['content'])
         self.assertEqual(result['results'][0]['confidence'],'Medium')
         self.assertEqual(result['results'][0]['label'],'Likely solution')
+        self.assertEqual(result['ai_solutioning']['provenance'],'AI-generated; not consultant-verified')
+        self.assertEqual(result['ai_solutioning']['functional_assessment'],'')
 
     def test_fabricated_citation_rejected(self):
         source=self.source()
@@ -146,6 +170,22 @@ class AIGroundingTests(StoreCase):
         self.assertEqual(result['results'][0]['confidence'],'Low')
         self.assertEqual(result['state'],'Insufficient evidence')
 
+    def test_contextual_metadata_boosts_matching_module_and_platform(self):
+        matching=create_source(source_data() | dict(title='FI matching source',module='FI',platform='S/4HANA',business_process='invoice posting'),self.store,self.ai)
+        other=create_source(source_data() | dict(title='Other module source',content='Different procedure for connection settings and validation.',module='MM',platform='ECC'),self.store,self.ai)
+        ticket=self.ticket()
+        ticket.update(module='FI',platform='S/4HANA',business_process='invoice posting')
+        ranked,_=rank_candidates(ticket,self.store,self.ai)
+        scores={row['source']['id']:row['score'] for row in ranked}
+        self.assertGreater(scores[matching['id']],scores[other['id']])
+
+    def test_conflicting_sources_report_both_ids(self):
+        left=dict(source=dict(id='A',error_code='E-1',application='SAP FI',version='v1',solution='Open period'))
+        right=dict(source=dict(id='B',error_code='E-1',application='SAP FI',version='v1',solution='Do not open period'))
+        conflicts=conflicting_sources([left,right])
+        self.assertEqual(conflicts['A'],{'B'})
+        self.assertEqual(conflicts['B'],{'A'})
+
     def test_indexing_failure_preserves_real_document_for_retry(self):
         self.ai.embed.side_effect=AIError('API key missing')
         source=self.source()
@@ -172,7 +212,9 @@ class WorkflowTests(StoreCase):
         ticket=server.update_investigation(ticket,'decision',dict(source_id=source['id'],decision='Accepted'))
         ticket=server.update_investigation(ticket,'outcome',dict(status='Resolved',notes='Validated against quality test record.',tested=True,customer_confirmed=True))
         stored=self.store.get(ticket['id'],'investigation')
-        self.assertEqual(stored['status'],'Resolved')
+        self.assertEqual(stored['status'],'Awaiting validation')
+        self.assertEqual(stored['outcome']['status'],'Resolved')
+        self.assertEqual(stored['lifecycle_stage'],'Ticket Creation')
         self.assertEqual(len(stored['timeline']),4)
 
     def test_invalid_resolution_validation(self):
@@ -184,16 +226,168 @@ class WorkflowTests(StoreCase):
         with self.assertRaises(ValueError):
             server.update_investigation(self.ticket('Change request'),'outcome',dict(status='Resolved',notes='Reviewed',tested=True,customer_confirmed=True,alternative_solution='Procedure'))
 
+    def advance(self,item,stage,**extra):
+        return server.transition_lifecycle(item,dict(stage=stage,notes=f'Recorded {stage} action.',**extra))
+
+    def test_incident_and_service_request_follow_standard_lifecycle(self):
+        for kind in ('Incident','Service request'):
+            with self.subTest(kind=kind):
+                item=self.ticket(kind)
+                self.assertEqual(item['lifecycle_stage'],'Ticket Creation')
+                for stage in ('Ticket Acceptance','Acknowledgment','Clarification'):
+                    item=self.advance(item,stage)
+                with self.assertRaisesRegex(ValueError,'proposed solution'):
+                    self.advance(item,'Solutioning')
+                item=server.update_solutioning(item,dict(section='functional',fields={'proposed_solution':'Follow the validated customer process.'}))
+                item=self.advance(item,'Solutioning')
+                item=server.update_investigation(item,'outcome',dict(status='Worked',notes='Validated by customer.',alternative_solution='Follow the validated customer process.',tested=True,customer_confirmed=True))
+                item=self.advance(item,'Closure')
+                saved=self.store.get(item['id'],'investigation')
+                self.assertEqual(saved['type'],kind)
+                self.assertEqual(saved['lifecycle_stage'],'Closure')
+                self.assertEqual([e['stage'] for e in saved['lifecycle_history']],['Ticket Creation','Ticket Acceptance','Acknowledgment','Clarification','Solutioning','Closure'])
+                self.assertEqual(saved['outcome']['status'],'Worked')
+                self.assertEqual(saved['status'],'Closed')
+
+    def test_invalid_lifecycle_skip_rejected(self):
+        item=self.ticket()
+        with self.assertRaisesRegex(ValueError,'exactly one stage'):
+            self.advance(item,'Clarification')
+
+    def test_change_request_requires_approval_development_deployment_verification_then_closure(self):
+        item=self.ticket('Change request')
+        for stage in ('Ticket Acceptance','Acknowledgment','Clarification'):
+            item=self.advance(item,stage)
+        item=server.update_solutioning(item,dict(section='functional',fields={'proposed_solution':'Add the requested business behavior.'}))
+        item=self.advance(item,'Solutioning')
+        item=self.advance(item,'Approval',approval_status='Pending')
+        with self.assertRaisesRegex(ValueError,'cannot start until'):
+            self.advance(item,'Development')
+        item=server.record_approval(item,dict(status='Approved',notes='Customer approval reference CR-7.'))
+        item=self.advance(item,'Development')
+        item=server.update_solutioning(item,dict(section='technical',fields={'implementation_approach':'Implement the approved behavior and deploy via change controls.'}))
+        item=self.advance(item,'Deployment')
+        item=self.advance(item,'Verification')
+        item=server.record_verification(item,dict(result='Passed',notes='Verification passed in the quality environment.'))
+        item=server.update_investigation(item,'outcome',dict(status='Worked',notes='Customer confirmed after verification.',alternative_solution='Approved implementation',tested=True,customer_confirmed=True,approved=True,developed=True,deployed=True,verified=True))
+        item=self.advance(item,'Closure')
+        saved=self.store.get(item['id'],'investigation')
+        stages=[entry['stage'] for entry in saved['lifecycle_history']]
+        self.assertEqual(stages,['Ticket Creation','Ticket Acceptance','Acknowledgment','Clarification','Solutioning','Approval','Development','Deployment','Verification','Closure'])
+        self.assertEqual(saved['verification']['result'],'Passed')
+        self.assertEqual(saved['approval_decision']['status'],'Approved')
+
+    def test_change_cannot_close_before_verification_passes(self):
+        item=self.ticket('Change request')
+        for stage in ('Ticket Acceptance','Acknowledgment','Clarification'):
+            item=self.advance(item,stage)
+        item=server.update_solutioning(item,dict(section='technical',fields={'implementation_approach':'Implement after customer approval.'}))
+        item=self.advance(item,'Solutioning')
+        item=self.advance(item,'Approval',approval_status='Approved')
+        item=self.advance(item,'Development')
+        item=self.advance(item,'Deployment')
+        item=self.advance(item,'Verification',verification_result='Failed')
+        item=server.update_investigation(item,'outcome',dict(status='Partially worked',notes='Verification did not pass.',alternative_solution='Pending fix',tested=True))
+        with self.assertRaisesRegex(ValueError,'verification has passed'):
+            self.advance(item,'Closure')
+
+    def test_verification_is_separate_repeatable_and_persisted(self):
+        item=self.ticket('Change request')
+        for stage in ('Ticket Acceptance','Acknowledgment','Clarification'):
+            item=self.advance(item,stage)
+        item=server.update_solutioning(item,dict(section='technical',fields={'implementation_approach':'Approved implementation proposal.'}))
+        item=self.advance(item,'Solutioning')
+        item=self.advance(item,'Approval',approval_status='Approved')
+        item=self.advance(item,'Development')
+        item=self.advance(item,'Deployment')
+        item=self.advance(item,'Verification')
+        self.assertEqual(item['verification']['result'],'Pending')
+        item=server.record_verification(item,dict(result='Failed',notes='Expected output did not match.'))
+        self.assertEqual(item['lifecycle_stage'],'Verification')
+        item=server.record_verification(item,dict(result='Passed',notes='Retest passed; evidence TEST-9.'))
+        saved=self.store.get(item['id'],'investigation')
+        self.assertEqual(saved['verification']['result'],'Passed')
+        self.assertEqual([entry['result'] for entry in saved['verification_history']],['Pending','Failed','Passed'])
+        self.assertEqual(len([e for e in saved['timeline'] if e['kind']=='Verification']),3)
+
+    def test_legacy_terminal_ticket_does_not_get_invented_lifecycle_history(self):
+        item=self.ticket()
+        item['status']='Resolved'
+        item.pop('lifecycle_history')
+        item.pop('lifecycle_history_tracked')
+        item.pop('lifecycle_stage')
+        view=server.lifecycle_view(item)
+        self.assertFalse(view['history_tracked'])
+        self.assertIsNone(view['next_stage'])
+        self.assertEqual(view['current_stage'],'Lifecycle not tracked for this imported record')
+        with self.assertRaisesRegex(ValueError,'already terminal'):
+            self.advance(item,'Ticket Acceptance')
+
+    def test_functional_and_technical_solutioning_are_separate_and_persist(self):
+        item=self.ticket()
+        item=server.update_solutioning(item,dict(section='functional',fields={'expected_behaviour':'Customer expects one approval.'}))
+        item=server.update_solutioning(item,dict(section='technical',fields={'risks':'Interface compatibility must be checked.'}))
+        saved=self.store.get(item['id'],'investigation')
+        self.assertEqual(saved['solutioning']['functional']['customer_problem'],saved['description'])
+        self.assertEqual(saved['solutioning']['functional']['expected_behaviour'],'Customer expects one approval.')
+        self.assertEqual(saved['solutioning']['technical']['risks'],'Interface compatibility must be checked.')
+        self.assertEqual(len(saved['solutioning_history']),2)
+        self.assertEqual([event['source'] for event in saved['timeline'] if event['source'] in ('Functional solutioning','Technical solutioning')],['Functional solutioning','Technical solutioning'])
+
+    def test_outcome_updates_preserve_feedback_and_history(self):
+        item=self.ticket()
+        original_status=item['status']
+        item=server.update_investigation(item,'outcome',dict(status='Partially worked',notes='First result.',usefulness='Partly useful'))
+        self.assertEqual(item['status'],original_status)
+        self.assertEqual(item['lifecycle_stage'],'Ticket Creation')
+        item=server.update_investigation(item,'outcome',dict(status='Did not work',notes='Retest failed.',usefulness='Not useful'))
+        saved=self.store.get(item['id'],'investigation')
+        self.assertEqual(saved['outcome']['status'],'Did not work')
+        self.assertEqual(saved['outcome_history'][0]['status'],'Partially worked')
+        self.assertEqual(len([event for event in saved['timeline'] if event['kind']=='Outcome']),2)
+
     def test_new_evidence_invalidates_recommendations(self):
         ticket=server.update_investigation(self.ticket(),'analyze',{})
         ticket=server.update_investigation(ticket,'note',dict(kind='Test',text='A different result was observed.'))
         self.assertIsNone(ticket['analysis'])
+
+    def test_search_evidence_does_not_advance_new_ticket_status_or_lifecycle(self):
+        ticket=self.ticket()
+        ticket=server.update_investigation(ticket,'analyze',{})
+        self.assertEqual(ticket['status'],'New')
+        self.assertEqual(ticket['lifecycle_stage'],'Ticket Creation')
+        self.assertIsNotNone(ticket['analysis'])
+
+    def test_search_evidence_is_available_after_outcome_and_closure_without_reopening(self):
+        ticket=self.ticket()
+        ticket['status']='Closed'
+        ticket['lifecycle_stage']='Closure'
+        ticket['lifecycle_history'].append(dict(stage='Closure',at=server.now(),author='Tester',notes='Closed.'))
+        ticket['outcome']=dict(status='Worked',notes='Previously validated.',recorded_at=server.now(),selected_source='SRC-KEEP',usefulness='Useful',tested=True,customer_confirmed=True)
+        ticket['selected_source']='SRC-KEEP'
+        ticket['decisions']={'SRC-KEEP':'Accepted'}
+        self.store.save(ticket)
+        refreshed=self.store.get(ticket['id'],'investigation')
+        analyzed=server.update_investigation(refreshed,'analyze',{})
+        persisted=self.store.get(ticket['id'],'investigation')
+        self.assertIsNotNone(persisted['analysis'])
+        self.assertEqual(persisted['status'],'Closed')
+        self.assertEqual(persisted['lifecycle_stage'],'Closure')
+        self.assertEqual(persisted['outcome']['notes'],'Previously validated.')
+        self.assertEqual(persisted['selected_source'],'SRC-KEEP')
+        self.assertEqual(persisted['decisions'],{'SRC-KEEP':'Accepted'})
+        self.assertEqual(analyzed['status'],'Closed')
 
     def test_imported_chronology_is_preserved(self):
         data=dict(title='Actual ticket',description='Details',timeline=[dict(at='2026-10-14T10:00:00+08:00',text='Later'),dict(at='2026-10-14T00:00:00Z',text='Earlier')])
         result=server.parse_intake(dict(content=json.dumps(data)),use_ai=True)
         self.assertEqual([e['text'] for e in result['timeline']],['Earlier','Later'])
         self.ai.extract.assert_not_called()
+
+    def test_imported_timeline_event_kinds_are_preserved(self):
+        data=dict(description='Problem',timeline=[dict(at='2026-10-14T00:00:00Z',text='Customer confirmed steps',kind='Clarification',author='Customer',source='mail-1')])
+        event=server.parse_intake(dict(content=json.dumps(data)))['timeline'][0]
+        self.assertEqual((event['kind'],event['author'],event['source']),('Clarification','Customer','mail-1'))
 
     def test_unstructured_intake_calls_ai(self):
         self.ai.extract.return_value=dict(title='Extracted title',description='Reported issue',timeline=[])
@@ -238,6 +432,16 @@ class FileTests(unittest.TestCase):
         self.assertIn('[Sheet: Tickets]',extracted)
         self.assertIn('INC-42 | Posting period closed',extracted)
         self.assertEqual(self.upload('tickets.csv',b'ID,Summary\r\nINC-42,Closed')['content'],'ID,Summary\r\nINC-42,Closed')
+
+    def test_html_and_powerpoint_extraction(self):
+        html=self.upload('guide.html',b'<h1>Posting guide</h1><script>private_code()</script><p>Check the period.</p>')['content']
+        self.assertIn('Posting guide',html)
+        self.assertIn('Check the period.',html)
+        self.assertNotIn('private_code',html)
+        pptx=io.BytesIO()
+        with zipfile.ZipFile(pptx,'w') as archive:
+            archive.writestr('ppt/slides/slide1.xml','<p:sld xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main" xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"><a:t>Validate in quality</a:t></p:sld>')
+        self.assertIn('Validate in quality',self.upload('guide.pptx',pptx.getvalue())['content'])
 
     def test_bad_and_unsupported_uploads(self):
         for name,data in [('bad.json',b'{broken'),('script.exe',b'content'),('empty.txt',b'')]:
@@ -306,7 +510,7 @@ class ProviderTests(unittest.TestCase):
     def test_ticket_extraction_validates_gemini_json(self):
         cfg=replace(config(),api_key='test-key-not-real')
         ticket=dict(title='Reported failure',description='Original symptom',ticket_id='',application='Test App',
-            version='1.0',error_code='',customisation='',type='Incident',priority='Medium',timeline=[])
+            platform='',module='',business_process='',version='1.0',error_code='',customisation='',type='Incident',priority='Medium',timeline=[])
         with self.client(lambda r:httpx.Response(200,json=self.generation(json.dumps(ticket)))) as client:
             self.assertEqual(AIService(cfg,client).extract('Original ticket'),ticket)
 
@@ -378,7 +582,7 @@ class ProviderTests(unittest.TestCase):
     def test_ticket_schema_preserves_title_and_local_timeline_limit(self):
         cfg=replace(config(),api_key='test-key-not-real')
         requests=[]
-        ticket=dict(title='Test ticket',description='Symptom',ticket_id='',application='App',version='1',
+        ticket=dict(title='Test ticket',description='Symptom',ticket_id='',application='App',platform='',module='',business_process='',version='1',
             error_code='',customisation='',type='Incident',priority='Medium',timeline=[])
         def transport(request):
             requests.append(json.loads(request.content))
@@ -491,6 +695,33 @@ class HttpTests(StoreCase):
         with self.assertRaises(HTTPError) as caught:
             urlopen(request)
         self.assertEqual(caught.exception.code,403)
+
+    def test_lifecycle_endpoint_persists_stage_and_exposes_it_in_state(self):
+        item=self.ticket()
+        data=json.dumps(dict(stage='Ticket Acceptance',notes='Accepted by the support consultant.')).encode()
+        request=Request(self.url+f"/api/investigations/{item['id']}/lifecycle",data=data,headers={'Content-Type':'application/json'})
+        with urlopen(request) as response:
+            changed=json.load(response)
+        self.assertEqual(changed['lifecycle_stage'],'Ticket Acceptance')
+        with urlopen(self.url+'/api/state') as response:
+            state=json.load(response)
+        persisted=next(record for record in state['investigations'] if record['id']==item['id'])
+        self.assertEqual(persisted['lifecycle']['current_stage'],'Ticket Acceptance')
+        self.assertEqual([entry['stage'] for entry in persisted['lifecycle_history']],['Ticket Creation','Ticket Acceptance'])
+
+    def test_solutioning_endpoint_persists_both_sections(self):
+        item=self.ticket()
+        for section,fields in [('functional',{'expected_behaviour':'Customer expects a guided approval.'}),('technical',{'risks':'Integration compatibility requires testing.'})]:
+            body=json.dumps(dict(section=section,fields=fields)).encode()
+            request=Request(self.url+f"/api/investigations/{item['id']}/solutioning",data=body,headers={'Content-Type':'application/json'})
+            with urlopen(request) as response:
+                saved=json.load(response)
+        with urlopen(self.url+'/api/state') as response:
+            state=json.load(response)
+        persisted=next(record for record in state['investigations'] if record['id']==item['id'])
+        self.assertEqual(persisted['solutioning']['functional']['expected_behaviour'],'Customer expects a guided approval.')
+        self.assertEqual(persisted['solutioning']['technical']['risks'],'Integration compatibility requires testing.')
+        self.assertEqual(saved['id'],item['id'])
 
 
 @unittest.skipUnless(os.getenv('RUN_MONGO_TESTS')=='1','Set RUN_MONGO_TESTS=1 to test a real MongoDB instance.')

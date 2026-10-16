@@ -117,7 +117,7 @@ def main():
         # Build comprehensive and citation-friendly content
         content_lines = [
             f"Ticket: {ticket_id} - {title}",
-            f"Customer: {r['customer']} | Visibility: {r['visibility']}",
+            f"Customer: {'General (customer identity removed)' if r['visibility'] == 'shared_generalized' else r['customer']} | Visibility: {r['visibility']}",
             f"System: {r['platform']} {r['release']} | Module: {r['module']} {r['component']}",
             f"Problem: {r['problem_statement']}",
         ]
@@ -137,7 +137,12 @@ def main():
         content = "\n".join(content_lines)
         stamp = now()
 
-        validation = 'Verified' if r['resolution_quality'] == 'Confirmed root cause' else 'Reviewed'
+        # The source data has no explicit test/customer-confirmation/deployment
+        # evidence fields. Keep every imported source reviewed, never verified.
+        validation = 'Reviewed'
+        solution_kind = ('Workaround' if r['resolution_quality'] == 'Workaround only'
+            else 'Likely solution' if r['resolution_quality'] == 'Confirmed root cause'
+            else 'Unknown')
         source = dict(
             id=ticket_id,
             title=title[:200],
@@ -146,14 +151,21 @@ def main():
             version=ver[:100],
             error_code=err[:100],
             customer=customer,
+            generalization_confirmed=r['visibility'] == 'shared_generalized',
             source_type='Historical ticket',
             filename='synthetic_tickets.xlsx',
             source_reference=ticket_id,
             content_hash=hashlib.sha256(content.encode()).hexdigest(),
             validation=validation,
-            validation_evidence={'tested': True, 'customer_confirmed': True, 'deployed': True} if validation == 'Verified' else {},
-            solution_kind='Likely solution' if validation == 'Verified' else 'Workaround',
+            validation_evidence={},
+            solution_kind=solution_kind,
+            platform=r['platform'],
+            module=r['module'],
+            business_process=r['scenario_group'],
+            customisation=r['component'] if r['customized'] == 'True' else '',
+            root_cause=r['root_cause'],
             solution=r['resolution'],
+            source_updated_at='',
             steps=[r['resolution']] if r['resolution'] else [],
             conflicts_with=[],
             created_at=stamp,
@@ -165,6 +177,7 @@ def main():
             embedding_model='',
             revision=0
         )
+        source['data_origin'] = 'Synthetic demo'
         sources_to_index.append(source)
 
     # 4. Batch embed the sources
@@ -220,6 +233,9 @@ def main():
             title=title[:200],
             description=desc,
             application=app[:100],
+            platform=r['platform'],
+            module=r['module'],
+            business_process=r['scenario_group'],
             version=ver[:100],
             error_code=err[:100],
             customisation=r['component'] if r['customized'] == 'True' else '',
@@ -238,6 +254,7 @@ def main():
             outcome=None,
             revision=1
         )
+        inv_item['data_origin'] = 'Synthetic demo'
         if r['ground_truth']:
             try:
                 inv_item['ground_truth'] = json.loads(r['ground_truth'])
@@ -258,44 +275,54 @@ def main():
 
         created_stamp = f"{r['created']}T08:00:00+00:00" if r['created'] else now()
         closed_stamp = f"{r['closed']}T16:00:00+00:00" if r['closed'] else now()
+        # These are imported closed historical cases. The dataset does not
+        # prove customer confirmation, production deployment, or usefulness.
+        historical_outcome = ('Resolved' if r['resolution_quality'] == 'Confirmed root cause'
+            else 'Workaround' if r['resolution_quality'] == 'Workaround only'
+            else 'Closed - other')
         inv_item = dict(
             id=f"INV-{ticket_id}",
             ticket_id=ticket_id,
             title=title[:200],
             description=desc,
             application=app[:100],
+            platform=r['platform'],
+            module=r['module'],
+            business_process=r['scenario_group'],
             version=ver[:100],
             error_code=err[:100],
             customisation=r['component'] if r['customized'] == 'True' else '',
             type=r['ticket_type'] if r['ticket_type'] in ('Incident', 'Service request', 'Problem', 'Change request') else 'Incident',
             priority=r['priority'] if r['priority'] in ('Low', 'Medium', 'High', 'Critical') else 'Medium',
             customer=customer,
-            status='Resolved',
+            status=historical_outcome,
             created_at=created_stamp,
             updated_at=closed_stamp,
             timeline=[
                 dict(at=created_stamp, kind='Intake', text=desc[:150], author='Consultant', source=ticket_id),
-                dict(at=closed_stamp, kind='Outcome', text=f"Root cause: {r['root_cause']}. Fix: {r['resolution']}", author='Consultant', source='Closed investigation')
+                *([dict(at=created_stamp.replace('T08:00:00', 'T12:00:00'), kind='Investigation', text=r['investigation_notes'], author='Consultant', source='Synthetic ticket history')] if r['investigation_notes'] else []),
+                dict(at=closed_stamp, kind='Outcome', text=f"Recorded resolution quality: {r['resolution_quality']}. Root cause: {r['root_cause']}. Fix/workaround: {r['resolution']}", author='Consultant', source='Closed investigation')
             ],
             analysis=None,
             decisions={},
             selected_source=ticket_id,
             outcome=dict(
-                status='Resolved',
+                status=historical_outcome,
                 notes=r['resolution'],
                 recorded_at=closed_stamp,
                 selected_source=ticket_id,
                 alternative_solution='',
-                usefulness='Useful',
-                tested=True,
-                customer_confirmed=True,
-                approved=True,
-                developed=True,
-                deployed=True,
-                verified=True
+                usefulness='Not rated',
+                tested=False,
+                customer_confirmed=False,
+                approved=False,
+                developed=False,
+                deployed=False,
+                verified=False
             ),
             revision=1
         )
+        inv_item['data_origin'] = 'Synthetic demo'
         store.db.investigations.replace_one({'id': inv_item['id']}, inv_item, upsert=True)
 
     print(f'Successfully seeded {len(history_rows) + len(incoming_rows)} investigations.')
