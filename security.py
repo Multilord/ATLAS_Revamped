@@ -249,8 +249,12 @@ def review_record(db, record, data):
         raise ValueError('External AI permission must be a boolean.')
     findings = screen(record_text(record))
     external = data.get('external_ai', False)
-    if external and (classification != 'Internal' or findings or status != 'Approved'):
-        raise SecurityError('External AI requires approved Internal content with no screening findings. Redact or revise it first.')
+    if external and classification != 'Internal':
+        raise SecurityError('Confidential and Restricted content must remain local. External AI permission requires Internal classification under your company policy.')
+    if external and status != 'Approved':
+        raise SecurityError('External AI permission requires an Approved review decision.')
+    if external and findings:
+        raise SecurityError('External AI is blocked by screening findings: ' + ', '.join(findings) + '. Redact or revise the flagged content before review.')
     previous = record.get('security')
     if previous:
         record.setdefault('security_history', []).append(previous)

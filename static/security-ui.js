@@ -26,6 +26,25 @@ export function createSecurityUI({esc,openModal,refresh,getState,getCurrent}) {
     if(!roles.includes('Reviewer'))root.querySelectorAll('[data-action="review-source"]').forEach(el=>{el.disabled=true;el.title='Reviewer role required';});
     if(!roles.includes('Approver'))root.querySelectorAll('[data-action="approval"]').forEach(el=>{el.disabled=true;el.title='Approver role required';});
   }
+  function showError(message) {
+    const error=document.querySelector('#modal[open] #form-error') || document.querySelector('#security-error');
+    if(error){error.textContent=message;error.classList.remove('hidden');error.scrollIntoView({block:'nearest'});}
+    else {const notice=document.createElement('p');notice.className='inline-error';notice.setAttribute('role','alert');notice.textContent=message;document.querySelector('#app').prepend(notice);}
+  }
+  function syncDisclosure(form) {
+    if(!form)return;
+    const classification=form.elements.classification.value, decision=form.elements.status.value;
+    const screened=form.dataset.screeningBlocked==='true', checkbox=form.elements.external_ai;
+    checkbox.disabled=classification!=='Internal'||decision!=='Approved'||screened;
+    if(checkbox.disabled)checkbox.checked=false;
+    form.querySelector('#security-ai-hint').textContent=screened
+      ? 'External AI is blocked by the screening findings above. Redact the flagged content and reopen this review.'
+      : classification!=='Internal'
+      ? 'Confidential and Restricted content stays local. Choose Internal only if the content meets your company policy for external AI processing.'
+      : decision!=='Approved'
+      ? 'Rejected content cannot be sent to Gemini. External AI permission requires an Approved decision.'
+      : 'You may explicitly allow this reviewed Internal content to be sent to Gemini. Leaving this unchecked keeps external AI blocked.';
+  }
   async function action(el) {
     const action=el.dataset.security;
     if(action==='logout'){await request('/auth/logout',{});location.reload();}
@@ -38,10 +57,14 @@ export function createSecurityUI({esc,openModal,refresh,getState,getCurrent}) {
     if(action==='review'||action==='redact') {
       const kind=el.dataset.kind, record=(kind==='sources'?getState().sources:getState().investigations).find(r=>r.id===el.dataset.id);
       const content=kind==='sources'?record.content:record.description;
-      const screening=await request('/security/screen',{content});
+      const screening=await request('/security/screen',{record_kind:kind,record_id:record.id,revision:record.revision});
       const hidden=`<input type="hidden" name="kind" value="${kind}"><input type="hidden" name="record_id" value="${esc(record.id)}"><input type="hidden" name="revision" value="${record.revision}">`;
       if(action==='redact')openModal('Review and redact text',`<form id="security-redact">${hidden}<p>Screening: ${esc(screening.findings.join(', ') || 'No patterns detected; manual review is still required.')}</p><label>Title<input name="title" required maxlength="200" value="${esc(record.title)}"></label><label>Content<textarea name="content" rows="14" required maxlength="120000">${esc(content)}</textarea></label><label>Reason<textarea name="notes" required minlength="5" maxlength="4000"></textarea></label><p class="hint">Changes invalidate security approval and AI results. Source indexes are removed. Existing history and backups may retain earlier content; this is not a complete erasure operation.</p><button class="btn primary">Save revised text</button></form>`);
-      else openModal('Review security and AI disclosure',`<form id="security-review">${hidden}<h3>${esc(record.title)}</h3><p>Screening: ${esc(screening.findings.join(', ') || 'No patterns detected; manual review is still required.')}</p><details><summary>Inspect record text and metadata</summary><pre class="source-content">${esc(JSON.stringify(record,(key,value)=>['analysis','security_history'].includes(key)?undefined:value,2))}</pre></details><label>Classification<select name="classification"><option>Restricted</option><option>Confidential</option><option>Internal</option></select></label><label>Decision<select name="status"><option>Approved</option><option>Rejected</option></select></label><label class="check"><input type="checkbox" name="external_ai"> Allow this reviewed Internal content to be sent to Google Gemini</label><label>Review notes<textarea name="notes" required minlength="5" maxlength="4000"></textarea></label><p class="hint">Review applies to this content version. An independent reviewer is required.</p><button class="btn primary">Record security decision</button></form>`);
+      else {
+        const policy=record.security || {};
+        openModal('Review security and AI disclosure',`<form id="security-review" data-screening-blocked="${screening.findings.length>0}">${hidden}<h3>${esc(record.title)}</h3><p>Screening: ${esc(screening.findings.join(', ') || 'No patterns detected; manual review is still required.')}</p><details><summary>Inspect record text and metadata</summary><pre class="source-content">${esc(JSON.stringify(record,(key,value)=>['analysis','security_history'].includes(key)?undefined:value,2))}</pre></details><label>Classification<select name="classification">${['Restricted','Confidential','Internal'].map(value=>`<option ${value===(policy.classification || 'Restricted')?'selected':''}>${value}</option>`).join('')}</select></label><label>Decision<select name="status"><option ${policy.status!=='Rejected'?'selected':''}>Approved</option><option ${policy.status==='Rejected'?'selected':''}>Rejected</option></select></label><label class="check"><input type="checkbox" name="external_ai" aria-describedby="security-ai-hint" ${policy.external_ai===true?'checked':''}> Allow this reviewed Internal content to be sent to Google Gemini</label><p class="hint" id="security-ai-hint" role="status"></p><label>Review notes<textarea name="notes" required minlength="5" maxlength="4000">${esc(policy.notes || '')}</textarea></label><p class="hint">Review applies to this content version. An independent reviewer is required.</p><button class="btn primary">Record security decision</button></form>`);
+        syncDisclosure(document.querySelector('#security-review'));
+      }
     }
   }
   async function actionAdmin(){return action({dataset:{security:'admin'}});}
@@ -59,12 +82,15 @@ export function createSecurityUI({esc,openModal,refresh,getState,getCurrent}) {
   }
   document.addEventListener('click',async event=>{
     const el=event.target.closest('[data-security]');if(!el)return;
-    el.disabled=true;try{await action(el);}catch(e){alert(e.message);}finally{el.disabled=false;}
+    el.disabled=true;try{await action(el);}catch(e){showError(e.message);}finally{el.disabled=false;}
+  });
+  document.addEventListener('change',event=>{
+    if(event.target.matches('#security-review select[name=classification],#security-review select[name=status]'))syncDisclosure(event.target.form);
   });
   document.addEventListener('submit',async event=>{
     const form=event.target;if(!form.id.startsWith('security-'))return;
     event.preventDefault();const button=form.querySelector('button[type="submit"],button:not([type])');if(button)button.disabled=true;
-    try{await submit(form);}catch(e){const error=document.querySelector('#security-error');if(error)error.textContent=e.message;else alert(e.message);}finally{if(button)button.disabled=false;}
+    try{await submit(form);}catch(e){showError(e.message);}finally{if(button)button.disabled=false;}
   });
   return {start,bar,panel,applyPermissions,csrf:()=>csrf,user:()=>user};
 }

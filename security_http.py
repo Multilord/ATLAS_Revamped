@@ -86,6 +86,17 @@ def post(handler, path, data, store, workspace):
         handler.respond(200, {'ok': True})
         return True
     if path == '/api/security/screen':
+        if 'record_id' in data:
+            kind = {'sources': 'source', 'investigations': 'investigation'}.get(data.get('record_kind'))
+            if not kind or not isinstance(data['record_id'], str):
+                raise ValueError('Select a valid record to screen.')
+            record = store.get(data['record_id'], kind, include_chunks=True)
+            if not record:
+                raise security.SecurityError('Record not found.', 404)
+            if data.get('revision') != record.get('revision'):
+                raise security.SecurityError('Record changed. Reload before reviewing.', 409)
+            handler.respond(200, {'findings': security.screen(security.record_text(record)), 'revision': record['revision']})
+            return True
         text = data.get('content')
         if not isinstance(text, str) or len(text) > 120000:
             raise ValueError('Screen at most 120,000 characters.')

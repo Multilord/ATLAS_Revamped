@@ -107,6 +107,15 @@ class SecurityTests(StoreCase):
         security.review_record(self.store.db, source, dict(status='Approved', classification='Restricted', external_ai=False, notes='Retain as restricted evidence only.'))
         self.assertFalse(security.ai_allowed(source))
 
+    def test_disclosure_rejections_explain_classification_and_decision(self):
+        source=self.pending_source()
+        self.set_user(self.reviewer)
+        for classification in ('Restricted','Confidential'):
+            with self.assertRaisesRegex(security.SecurityError,'must remain local'):
+                security.review_record(self.store.db,source,dict(status='Approved',classification=classification,external_ai=True,notes='Reviewing disclosure permission.'))
+        with self.assertRaisesRegex(security.SecurityError,'Approved review decision'):
+            security.review_record(self.store.db,source,dict(status='Rejected',classification='Internal',external_ai=True,notes='Rejecting the supplied content.'))
+
     def test_ticket_ai_policy_blocks_before_quota_or_provider(self):
         ticket = self.ticket()
         with self.assertRaises(security.SecurityError):
@@ -212,6 +221,34 @@ class SecurityHttpTests(StoreCase):
         with self.assertRaises(HTTPError) as error:
             self.call('/api/state')
         self.assertEqual(error.exception.code, 401)
+
+    def test_review_screening_covers_metadata_and_checks_scope_and_revision(self):
+        ticket=self.ticket()
+        ticket['customisation']='api_key=screening-fixture-only'
+        self.store.save(ticket)
+        self.store.db.users.update_one({'id':self.user['id']},{'$set':{'roles':['Reviewer']}})
+        with self.call('/api/auth/login',dict(username='viewer',password='viewer-test-password')) as response:
+            cookie=response.headers['Set-Cookie'].split(';')[0]
+            csrf=json.load(response)['csrf']
+        payload=dict(record_kind='investigations',record_id=ticket['id'],revision=ticket['revision'])
+        with self.call('/api/security/screen',payload,cookie,csrf) as response:
+            screening=json.load(response)
+        self.assertEqual(screening['findings'],security.screen(security.record_text(ticket)))
+        self.assertIn('Possible credential',screening['findings'])
+        with self.assertRaises(HTTPError) as stale:
+            self.call('/api/security/screen',{**payload,'revision':ticket['revision']-1},cookie,csrf)
+        self.assertEqual(stale.exception.code,409)
+        with self.assertRaises(HTTPError) as denied:
+            self.call('/api/investigations/'+ticket['id']+'/security-review',dict(revision=ticket['revision'],classification='Internal',status='Approved',external_ai=True,notes='Trying disclosure of flagged metadata.'),cookie,csrf)
+        self.assertEqual(denied.exception.code,403)
+        self.assertIn('Possible credential',denied.exception.read().decode())
+        private={**ticket,'id':'PRIVATE-SCREEN','customer':'Another customer'}
+        self.store.db.investigations.insert_one(private)
+        with self.assertRaises(HTTPError) as other:
+            self.call('/api/security/screen',{**payload,'record_id':private['id']},cookie,csrf)
+        self.assertEqual(other.exception.code,404)
+        with self.call('/api/security/screen',{'content':'Ordinary local preview text'},cookie,csrf) as response:
+            self.assertEqual(json.load(response)['findings'],[])
 
     def test_viewer_cannot_write_or_admin_and_csrf_required(self):
         with self.call('/api/auth/login', dict(username='viewer', password='viewer-test-password')) as response:
