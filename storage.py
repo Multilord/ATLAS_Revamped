@@ -1,6 +1,7 @@
 """MongoDB is the only application datastore. No seeds or fallback database."""
 from pymongo import MongoClient, ASCENDING
 from pymongo.errors import DuplicateKeyError
+import security
 
 
 class ConflictError(Exception):
@@ -26,6 +27,13 @@ class MongoStore:
         self.client.admin.command('ping')
 
     def scope(self, kind):
+        user = security.principal.get()
+        if user:
+            own = {'customer': {'$in': user['customers']}}
+            shared = {'customer': 'General', 'generalization_confirmed': True, 'security.status': 'Approved', 'security.classification': 'Internal'}
+            if 'Reviewer' in user['roles']:
+                shared = {'customer': 'General', 'generalization_confirmed': True}
+            return {'$or': [own, shared]} if kind == 'source' else own
         if self.customer in ('My Workspace', 'All'):
             return {}
         return {'$or': [{'customer': self.customer}, {'customer': 'General', 'generalization_confirmed': True}]} if kind == 'source' else {'customer': self.customer}
@@ -49,6 +57,32 @@ class MongoStore:
 
     def save(self, item, kind='investigation'):
         cust = item.get('customer')
+        user = security.principal.get()
+        if user:
+            if not security.customer_allowed(cust) and not (cust == 'General' and 'Reviewer' in user['roles'] and item.get('generalization_confirmed') is True):
+                raise security.SecurityError('Customer scope is not permitted for this write.')
+            old = self.get(item['id'], kind, include_chunks=True)
+            if old is None:
+                item['created_by_id'] = user['id']
+                item['content_editor_id'] = user['id']
+                item['security'] = dict(status='Pending review', classification='Restricted', external_ai=False)
+                if kind == 'source':
+                    item['claimed_validation'] = item.get('validation')
+                    item['validation'] = 'Unverified'
+                    item['validation_evidence'] = {}
+            elif security.content_fingerprint(old) != security.content_fingerprint(item):
+                item['content_editor_id'] = user['id']
+                item.setdefault('security_history', []).append(old.get('security', {}))
+                item['security'] = dict(status='Pending review', classification=(old.get('security') or {}).get('classification', 'Restricted'), external_ai=False)
+                if kind == 'source':
+                    item.update(chunks=[], chunk_count=0, index_status='Pending', validation='Unverified', validation_evidence={})
+            if kind == 'investigation' and (old is None or security.proposal_hash(old) != security.proposal_hash(item)):
+                item['proposal_author_id'] = user['id']
+                prior = item.get('approval_decision')
+                if prior and prior.get('status') == 'Approved':
+                    item.setdefault('approval_history', []).append(prior)
+                    item['approval_decision'] = dict(status='Pending', notes='Proposal changed; independent approval required.')
+            security.audit(self.db, 'record.write.intent', item['id'], kind=kind, content_hash=security.content_fingerprint(item))
         if cust != self.customer and self.customer not in ('My Workspace', 'All') and cust != 'General':
             raise ValueError('Customer scope is not authorised for this write.')
         if kind == 'source' and cust == 'General' and self.customer not in ('My Workspace', 'All') and item.get('generalization_confirmed') is not True:
@@ -69,6 +103,8 @@ class MongoStore:
             except DuplicateKeyError:
                 raise ConflictError('This document is already in the workspace. Use its existing source or change the content.') from None
         item['revision'] = document['revision']
+        if user:
+            security.audit(self.db, 'record.write.completed', item['id'], kind=kind, revision=item['revision'])
         return item
 
     def indexed_chunks(self, model):

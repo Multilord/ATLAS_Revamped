@@ -13,8 +13,11 @@ from datetime import datetime, timezone
 from pathlib import Path
 from pypdf import PdfReader
 from docx import Document
+from docx.text.paragraph import Paragraph
+from docx.table import Table
 import openpyxl
 from ai import AIError
+import security
 
 MAX_FILE = 5 * 1024 * 1024
 MAX_TEXT = 120000
@@ -60,6 +63,15 @@ def extract_upload(data):
         raise ValueError('Invalid file encoding.') from None
     if not content or len(content) > MAX_FILE:
         raise ValueError('Files must be non-empty and at most 5 MB.')
+    if suffix == '.pdf' and not content.lstrip().startswith(b'%PDF-'):
+        raise ValueError('File signature does not match PDF.')
+    if suffix in ('.docx', '.pptx', '.xlsx', '.xlsm', '.xltx'):
+        if not zipfile.is_zipfile(io.BytesIO(content)):
+            raise ValueError('File signature does not match an Office document.')
+        with zipfile.ZipFile(io.BytesIO(content)) as archive:
+            members = archive.infolist()
+            if len(members) > 2000 or sum(i.file_size for i in members) > 20 * 1024 * 1024 or any(i.file_size > 10 * 1024 * 1024 or (i.file_size > 100000 and i.file_size / max(1, i.compress_size) > 200) for i in members):
+                raise ValueError('Office archive exceeds safe expansion limits.')
     try:
         if suffix == '.pdf':
             reader = PdfReader(io.BytesIO(content))
@@ -78,7 +90,15 @@ def extract_upload(data):
                 if sum(i.file_size for i in archive.infolist()) > 20 * 1024 * 1024:
                     raise ValueError('DOCX expands beyond the permitted size.')
             doc = Document(io.BytesIO(content))
-            text = '\n'.join([p.text for p in doc.paragraphs] + [' | '.join(c.text for c in row.cells) for table in doc.tables for row in table.rows])
+            parts = []
+            for element in doc.element.body:
+                if element.tag.endswith('}p'):
+                    paragraph = Paragraph(element, doc)
+                    if paragraph.text.strip():
+                        parts.append(paragraph.text)
+                elif element.tag.endswith('}tbl'):
+                    parts.extend(' | '.join(c.text for c in row.cells) for row in Table(element, doc).rows)
+            text = '\n\n'.join(parts)
         elif suffix == '.pptx':
             with zipfile.ZipFile(io.BytesIO(content)) as archive:
                 members = archive.infolist()
@@ -157,6 +177,8 @@ def chunks(text):
 
 
 def index_source(source, store, ai):
+    if security.principal.get():
+        security.enforce_ai(source)
     if source['customer'] != store.customer and store.customer not in ('My Workspace', 'All') and source['customer'] != 'General':
         raise ValueError('This source is outside the writable workspace.')
     pieces = chunks(source['content'])
@@ -174,20 +196,24 @@ def index_source(source, store, ai):
     return {k: v for k, v in source.items() if k != 'chunks'}
 
 
-def create_source(data, store, ai):
+def prepare_source(data, store):
     def text(key, limit, required=True):
         value = data.get(key, '')
         if not isinstance(value, str) or len(value) > limit or (required and not value.strip()):
             raise ValueError(f'{key} must be text, up to {limit} characters' + (' and not empty.' if required else '.'))
         return value.strip()
     target_customer = data.get('customer', store.customer)
+    if security.principal.get() and not security.customer_allowed(target_customer) and not (target_customer == 'General' and 'Reviewer' in security.principal.get()['roles']):
+        raise security.SecurityError('Customer scope is not permitted.')
+    if not isinstance(target_customer, str) or not target_customer.strip() or len(target_customer) > 200:
+        raise ValueError('Customer scope is required and must be under 200 characters.')
     if target_customer != store.customer and store.customer not in ('My Workspace', 'All') and target_customer != 'General':
         raise ValueError('Customer scope is not authorised.')
     if target_customer == 'General' and store.customer not in ('My Workspace', 'All') and data.get('generalized_confirmed') is not True:
         raise ValueError('Confirm that customer names, identifiers, secrets and account-specific details have been removed before sharing this source as General knowledge.')
     content = text('content', MAX_TEXT)
     source_type = data.get('source_type', 'Document')
-    if source_type not in ('Document', 'Historical ticket', 'Internal KB', 'SharePoint export', 'Confluence export', 'SAP reference'):
+    if source_type not in ('Document', 'Historical ticket', 'Internal KB', 'SharePoint export', 'Confluence export', 'SAP reference', 'Resolution guide', 'Investigation report', 'Known issue', 'Change record'):
         raise ValueError('Invalid source type.')
     stamp = now()
     source_updated_at = text('source_updated_at', 50, False)
@@ -226,5 +252,12 @@ def create_source(data, store, ai):
         validation_evidence={}, steps=[], conflicts_with=list(dict.fromkeys(conflicts)),
         created_at=stamp, updated_at=stamp, index_status='Pending', index_error='', chunk_count=0,
         chunks=[], embedding_model='', revision=0)
+    return source
+
+
+def create_source(data, store, ai):
+    source = prepare_source(data, store)
+    if not isinstance(data.get('index_now', False), bool):
+        raise ValueError('index_now must be true or false.')
     store.save(source, 'source')
-    return index_source(source, store, ai)
+    return index_source(source, store, ai) if data.get('index_now', False) else {k: v for k, v in source.items() if k != 'chunks'}

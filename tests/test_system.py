@@ -39,7 +39,7 @@ def response(recommendations=None):
 
 
 def source_data():
-    return dict(title='Test maintenance procedure', content='Inspect the connection configuration and validate the correction in quality.', application='Test App', version='1.0', source_type='Internal KB')
+    return dict(title='Test maintenance procedure', content='Inspect the connection configuration and validate the correction in quality.', application='Test App', version='1.0', source_type='Internal KB', index_now=True)
 
 
 class StoreCase(unittest.TestCase):
@@ -253,6 +253,29 @@ class WorkflowTests(StoreCase):
         item=self.ticket()
         with self.assertRaisesRegex(ValueError,'exactly one stage'):
             self.advance(item,'Clarification')
+
+    def test_recorded_terminal_closure_is_completed_independent_of_outcome(self):
+        for outcome in ('Resolved','Workaround','Unresolved','Escalated'):
+            with self.subTest(outcome=outcome):
+                item=self.ticket()
+                item.update(status=outcome,lifecycle_stage='Closure',outcome={'status':outcome},
+                    lifecycle_history=[{'stage':stage} for stage in server.STANDARD_LIFECYCLE])
+                view=server.lifecycle_view(item)
+                self.assertTrue(view['closed'])
+                self.assertTrue(all(stage['state']=='completed' for stage in view['stages']))
+                self.assertIsNone(view['next_stage'])
+                self.assertEqual(item['status'],outcome)
+                self.assertEqual(item['outcome']['status'],outcome)
+
+    def test_closure_display_requires_recorded_history_and_preserves_skips(self):
+        item=self.ticket('Change request')
+        item['lifecycle_stage']='Closure'
+        self.assertFalse(server.lifecycle_view(item)['closed'])
+        item['lifecycle_history'].append({'stage':'Closure'})
+        view=server.lifecycle_view(item)
+        self.assertTrue(view['closed'])
+        self.assertEqual(view['stages'][-1]['state'],'completed')
+        self.assertEqual(view['stages'][1]['state'],'skipped')
 
     def test_change_request_requires_approval_development_deployment_verification_then_closure(self):
         item=self.ticket('Change request')
@@ -668,6 +691,19 @@ class HttpTests(StoreCase):
         self.thread=threading.Thread(target=self.service.serve_forever,daemon=True)
         self.thread.start()
         self.url=f'http://127.0.0.1:{self.service.server_port}'
+        import security
+        security.initialize(self.store.db)
+        security.create_user(self.store.db, dict(username='http-test', name='HTTP Test', password='test-password-12345'), bootstrap=True, workspace=self.cfg.customer)
+        token, self.csrf, _ = security.login(self.store.db, dict(username='http-test', password='test-password-12345'), 'test')
+        self.cookie = 'atlas_session=' + token
+
+    def open(self, request):
+        if isinstance(request, str):
+            request = Request(request)
+        request.add_header('Cookie', self.cookie)
+        request.add_header('X-CSRF-Token', self.csrf)
+        return urlopen(request)
+
 
     def tearDown(self):
         self.service.shutdown()
@@ -676,7 +712,7 @@ class HttpTests(StoreCase):
         super().tearDown()
 
     def test_state_empty_and_no_credentials_exposed(self):
-        with urlopen(self.url+'/api/state') as res:
+        with self.open(self.url+'/api/state') as res:
             state=json.load(res)
         self.assertEqual(state['investigations'],[])
         self.assertEqual(state['sources'],[])
@@ -686,24 +722,24 @@ class HttpTests(StoreCase):
     def test_ai_without_key_returns_actionable_failure(self):
         request=Request(self.url+'/api/ai/check',data=b'{}',headers={'Content-Type':'application/json'})
         with self.assertRaises(HTTPError) as caught:
-            urlopen(request)
+            self.open(request)
         self.assertEqual(caught.exception.code,502)
         self.assertIn('GEMINI_API_KEY',caught.exception.read().decode())
 
     def test_cross_origin_rejected(self):
         request=Request(self.url+'/api/sources',data=b'{}',headers={'Content-Type':'application/json','Origin':'https://example.com'})
         with self.assertRaises(HTTPError) as caught:
-            urlopen(request)
+            self.open(request)
         self.assertEqual(caught.exception.code,403)
 
     def test_lifecycle_endpoint_persists_stage_and_exposes_it_in_state(self):
         item=self.ticket()
         data=json.dumps(dict(stage='Ticket Acceptance',notes='Accepted by the support consultant.')).encode()
         request=Request(self.url+f"/api/investigations/{item['id']}/lifecycle",data=data,headers={'Content-Type':'application/json'})
-        with urlopen(request) as response:
+        with self.open(request) as response:
             changed=json.load(response)
         self.assertEqual(changed['lifecycle_stage'],'Ticket Acceptance')
-        with urlopen(self.url+'/api/state') as response:
+        with self.open(self.url+'/api/state') as response:
             state=json.load(response)
         persisted=next(record for record in state['investigations'] if record['id']==item['id'])
         self.assertEqual(persisted['lifecycle']['current_stage'],'Ticket Acceptance')
@@ -714,9 +750,9 @@ class HttpTests(StoreCase):
         for section,fields in [('functional',{'expected_behaviour':'Customer expects a guided approval.'}),('technical',{'risks':'Integration compatibility requires testing.'})]:
             body=json.dumps(dict(section=section,fields=fields)).encode()
             request=Request(self.url+f"/api/investigations/{item['id']}/solutioning",data=body,headers={'Content-Type':'application/json'})
-            with urlopen(request) as response:
+            with self.open(request) as response:
                 saved=json.load(response)
-        with urlopen(self.url+'/api/state') as response:
+        with self.open(self.url+'/api/state') as response:
             state=json.load(response)
         persisted=next(record for record in state['investigations'] if record['id']==item['id'])
         self.assertEqual(persisted['solutioning']['functional']['expected_behaviour'],'Customer expects a guided approval.')

@@ -4,6 +4,8 @@ import re
 import time
 from datetime import datetime, timezone
 from ai import AIError
+from historical import permitted, quality, synthetic
+import security
 
 STOP = set('the a an and or is are was were to of for in on with this that it by from unable cannot can not error issue sap reported user please'.split())
 MAX_SOURCE_AGE_DAYS = 540
@@ -57,7 +59,9 @@ def rank_candidates(ticket, store, ai, query_vector=None, limit=10):
     outcome_signals = store.outcome_signals(list({source['id'] for source, _ in indexed})) if hasattr(store, 'outcome_signals') else {}
     candidates = []
     for source, chunk in indexed:
-        if source.get('customer') not in (ticket.get('customer'), 'General'):
+        if security.principal.get() and not security.ai_allowed(source):
+            continue
+        if not permitted(source, ticket):
             continue
         similarity = max(0, cosine(query_vector, chunk['embedding']))
         overlap = len(query_tokens & tokens(chunk.get('text', ''))) / max(1, len(query_tokens))
@@ -72,7 +76,7 @@ def rank_candidates(ticket, store, ai, query_vector=None, limit=10):
         age = source_age(source)
         stale = source.get('validation') == 'Outdated' or (age is not None and age > MAX_SOURCE_AGE_DAYS)
         validation = source.get('validation_evidence') or {}
-        verified = source.get('validation') == 'Verified' and all(validation.get(k) for k in ('tested', 'customer_confirmed', 'deployed'))
+        verified = not synthetic(source) and quality(source) != 'Unresolved findings' and source.get('validation') == 'Verified' and all(validation.get(k) for k in ('tested', 'customer_confirmed', 'deployed'))
         outcome = outcome_signals.get(source['id'], {})
         successes, failures = outcome.get('validated_successes', 0), outcome.get('unsuccessful', 0)
         score = (.44 * similarity + .18 * overlap + .14 * exact_error + .06 * matches['application'] +
@@ -128,6 +132,8 @@ def conflicting_sources(selected):
 
 
 def retrieve(ticket, store, ai):
+    if security.principal.get():
+        security.enforce_ai(ticket)
     started = time.monotonic()
     ai.ensure_capacity(2)
     selected, notes = rank_candidates(ticket, store, ai)
@@ -139,6 +145,7 @@ def retrieve(ticket, store, ai):
             business_process=source.get('business_process', ''), customisation=source.get('customisation', ''),
             version=source.get('version', ''), source_updated_at=source.get('source_updated_at'),
             validation=source.get('validation', 'Unverified'), solution_kind=source.get('solution_kind', 'Unknown'),
+            evidence_quality=quality(source), synthetic=synthetic(source),
             outcome_signals=row['outcome'], conflicts_with=source.get('conflicts_with', []), text=chunk['text']))
     ticket_context = {k: ticket.get(k, '') for k in ('title','description','application','platform','module','business_process','version','error_code','customisation','type','priority')}
     ticket_context['consultant_solutioning'] = ticket.get('solutioning') or {}
@@ -158,6 +165,8 @@ def retrieve(ticket, store, ai):
         if source['id'] in seen: continue
         seen.add(source['id'])
         warnings = list(recommendation.warnings)
+        if synthetic(source): warnings.append('Synthetic demonstration evidence; not real customer validation.')
+        if quality(source) == 'Unresolved findings': warnings.append('Unresolved historical findings support diagnosis only; no confirmed fix is recorded.')
         if not row['matches']['application']: warnings.append('Application differs or is unspecified. Confirm applicability.')
         if row['mismatch_platform']: warnings.append('SAP platform differs. Check system-specific behavior before applying this guidance.')
         elif ticket.get('platform') and not row['matches']['platform']: warnings.append('Source platform is unspecified. Confirm applicability.')
@@ -173,6 +182,8 @@ def retrieve(ticket, store, ai):
         if (not row['matches']['application'] or row['mismatch_platform'] or row['mismatch_version'] or row['stale'] or conflicts.get(source['id'])): confidence = 'Low'
         elif confidence == 'High' and (not row['verified'] or warnings): confidence = 'Medium'
         label = 'Workaround' if source.get('solution_kind') == 'Workaround' or recommendation.kind == 'Workaround' else 'Verified historical fix' if row['verified'] else 'Likely solution'
+        if quality(source) == 'Unresolved findings':
+            label, confidence = 'Investigation findings', 'Low'
         reasons = list(dict.fromkeys(row['reasons'] + [recommendation.reason]))
         recommendations.append(dict(source_id=source['id'], chunk_id=chunk['id'], quote=recommendation.quote,
             title=recommendation.title, source_title=source['title'], source_type=source['source_type'],

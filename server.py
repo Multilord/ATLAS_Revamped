@@ -15,6 +15,10 @@ from storage import MongoStore, ConflictError
 from ai import AIService, AIError
 from engine import retrieve
 from ingestion import create_source, index_source, extract_upload
+import historical
+import security
+import security_http
+import uploads
 
 ROOT = Path(__file__).resolve().parent
 CUSTOMER = settings.customer
@@ -39,6 +43,8 @@ def now():
 
 def initialize():
     store.initialize()
+    security.initialize(store.db)
+    security.prepare_bootstrap(store.db)
 
 
 def records(kind):
@@ -147,6 +153,9 @@ def parse_intake(data, use_ai=False):
         if obj.get('customer', CUSTOMER) != CUSTOMER and CUSTOMER not in ('My Workspace', 'All'):
             raise ValueError('This installation is scoped to ' + CUSTOMER + '.')
     elif use_ai:
+        if security.principal.get():
+            if data.get('ai_confirmed') is not True or data.get('classification') != 'Internal' or security.screen(raw):
+                raise security.SecurityError('Review and redact the ticket first. AI extraction requires explicit Internal classification, external AI consent, and no screening findings. Manual entry remains available.')
         if len(raw) > 60000:
             raise ValueError('Ticket text exceeds 60,000 characters. Split attachments into knowledge documents.')
         obj = ai.extract(raw)
@@ -202,8 +211,8 @@ def create_investigation(data):
     timeline = parse_intake({'content': json.dumps({'description': item['description'], 'timeline': data.get('timeline', [])})})['timeline']
     stamp = now()
     functional = {'customer_problem': item['description']}
-    item.update(id='INV-' + uuid.uuid4().hex[:12].upper(), customer=target_customer, type=data['type'], priority=data['priority'], status='New', lifecycle_stage='Ticket Creation', lifecycle_history=[dict(stage='Ticket Creation', at=stamp, author=settings.consultant, notes='Ticket created and intake context recorded.')], lifecycle_history_tracked=True, solutioning={'functional': functional, 'technical': {}}, solutioning_history=[], created_at=stamp, updated_at=stamp, timeline=timeline, analysis=None, decisions={}, selected_source=None, outcome=None, revision=0)
-    item['timeline'].append(dict(at=stamp, kind='Intake', text='Ticket context reviewed and investigation created.', author=settings.consultant, source=item['ticket_id'] or 'Manual intake'))
+    item.update(id='INV-' + uuid.uuid4().hex[:12].upper(), customer=target_customer, type=data['type'], priority=data['priority'], status='New', lifecycle_stage='Ticket Creation', lifecycle_history=[dict(stage='Ticket Creation', at=stamp, author=(security.actor() if security.principal.get() else settings.consultant), notes='Ticket created and intake context recorded.')], lifecycle_history_tracked=True, solutioning={'functional': functional, 'technical': {}}, solutioning_history=[], created_at=stamp, updated_at=stamp, timeline=timeline, analysis=None, decisions={}, selected_source=None, outcome=None, revision=0)
+    item['timeline'].append(dict(at=stamp, kind='Intake', text='Ticket context reviewed and investigation created.', author=(security.actor() if security.principal.get() else settings.consultant), source=item['ticket_id'] or 'Manual intake'))
     save(item, 'created')
     return item
 
@@ -220,14 +229,15 @@ def lifecycle_view(item):
     current = item.get('lifecycle_stage') if tracked else ('Ticket Creation' if not legacy_terminal else None)
     history = item.get('lifecycle_history', []) if tracked else []
     completed = {event.get('stage') for event in history}
-    return dict(stages=[dict(name=name, state='completed' if name in completed and name != current else 'current' if name == current else 'upcoming') for name in stages],
+    closed = bool(tracked and current == 'Closure' and 'Closure' in completed)
+    return dict(stages=[dict(name=name, state='completed' if name in completed and (closed or name != current) else 'current' if name == current else 'skipped' if closed else 'upcoming') for name in stages],
         current_stage=current or 'Lifecycle not tracked for this imported record', history=history,
-        history_tracked=tracked, next_stage=(stages[stages.index(current)+1] if current in stages and stages.index(current)+1 < len(stages) and not legacy_terminal else None))
+        history_tracked=tracked, closed=closed, next_stage=(stages[stages.index(current)+1] if current in stages and stages.index(current)+1 < len(stages) and not legacy_terminal else None))
 
 
 def _event(item, kind, text, source='Investigation workspace', stamp=None):
     at = stamp or now()
-    item.setdefault('timeline', []).append(dict(at=at, kind=kind, text=text, author=settings.consultant, source=source))
+    item.setdefault('timeline', []).append(dict(at=at, kind=kind, text=text, author=(security.actor() if security.principal.get() else settings.consultant), source=source))
     return at
 
 
@@ -257,8 +267,8 @@ def update_solutioning(item, data):
     entry = item['solutioning'].setdefault(section, {})
     entry.update(cleaned)
     entry['updated_at'] = stamp
-    entry['updated_by'] = settings.consultant
-    item.setdefault('solutioning_history', []).append(dict(section=section, fields=sorted(cleaned), at=stamp, author=settings.consultant))
+    entry['updated_by'] = (security.actor() if security.principal.get() else settings.consultant)
+    item.setdefault('solutioning_history', []).append(dict(section=section, fields=sorted(cleaned), at=stamp, author=(security.actor() if security.principal.get() else settings.consultant)))
     if item.get('analysis'):
         item['analysis'] = None
         item['decisions'] = {}
@@ -305,16 +315,22 @@ def transition_lifecycle(item, data):
         if not item.get('selected_source') and not (solutioning.get('functional') or {}).get('proposed_solution','').strip() and not (solutioning.get('technical') or {}).get('implementation_approach','').strip():
             raise ValueError('A proposed solution is required before customer approval.')
         decision = data.get('approval_status', 'Pending')
+        if security.principal.get() and decision != 'Pending':
+            raise security.SecurityError('Enter Approval with Pending status, then have an independent approver record a decision.')
         if decision not in ('Pending', 'Approved', 'Rejected'):
             raise ValueError('Select Pending, Approved, or Rejected for customer approval.')
-        item['approval_decision'] = dict(status=decision, notes=notes, at=now(), author=settings.consultant)
+        item['approval_decision'] = dict(status=decision, notes=notes, at=now(), author=(security.actor() if security.principal.get() else settings.consultant))
     if current == 'Approval' and target == 'Development' and (item.get('approval_decision') or {}).get('status') != 'Approved':
         raise ValueError('Development cannot start until the change request is approved.')
+    if security.principal.get() and target in ('Development', 'Deployment', 'Verification') and item.get('type') == 'Change request':
+        approval = item.get('approval_decision') or {}
+        if approval.get('status') != 'Approved' or approval.get('proposal_hash') != security.proposal_hash(item) or not approval.get('actor_id'):
+            raise security.SecurityError('A current, attributable approval is required before progressing this change.')
     if target == 'Verification':
         deployment = next((event for event in reversed(history) if event.get('stage') == 'Deployment'), None)
         if not deployment:
             raise ValueError('Record the deployment stage before verification.')
-        item.setdefault('verification_history', []).append(dict(result='Pending', notes='Verification stage entered; no test result recorded yet.', at=now(), author=settings.consultant))
+        item.setdefault('verification_history', []).append(dict(result='Pending', notes='Verification stage entered; no test result recorded yet.', at=now(), author=(security.actor() if security.principal.get() else settings.consultant)))
         item['verification'] = item['verification_history'][-1]
     if target == 'Closure':
         outcome = item.get('outcome') or {}
@@ -329,9 +345,9 @@ def transition_lifecycle(item, data):
         if exception and exception not in ('Cancelled', 'Escalated', 'Approval rejected', 'Other'):
             raise ValueError('Unsupported lifecycle closure exception.')
         if exception:
-            item['closure_exception'] = dict(reason=exception, notes=notes, at=now(), author=settings.consultant)
+            item['closure_exception'] = dict(reason=exception, notes=notes, at=now(), author=(security.actor() if security.principal.get() else settings.consultant))
     stamp = now()
-    item.setdefault('lifecycle_history', []).append(dict(stage=target, at=stamp, author=settings.consultant, notes=notes))
+    item.setdefault('lifecycle_history', []).append(dict(stage=target, at=stamp, author=(security.actor() if security.principal.get() else settings.consultant), notes=notes))
     item['lifecycle_stage'] = target
     item['lifecycle_history_tracked'] = True
     item['updated_at'] = stamp
@@ -353,7 +369,12 @@ def record_approval(item, data):
         raise ValueError('Select Pending, Approved, or Rejected.')
     notes = required_text(data, 'notes', 4000)
     stamp = now()
-    item['approval_decision'] = dict(status=decision, notes=notes, at=stamp, author=settings.consultant)
+    item['approval_decision'] = dict(status=decision, notes=notes, at=stamp, author=(security.actor() if security.principal.get() else settings.consultant))
+    if security.principal.get():
+        prior = item.get('approval_history', [])
+        prior.append(security.approval(item, decision, notes))
+        item['approval_history'] = prior
+        item['approval_decision'] = prior[-1]
     item['updated_at'] = stamp
     _event(item, 'Approval', f'Customer approval decision: {decision}. {notes}', 'Change approval', stamp)
     save(item, 'approval')
@@ -368,7 +389,7 @@ def record_verification(item, data):
         raise ValueError('Select Passed, Failed, or Pending.')
     notes = required_text(data, 'notes', 4000)
     stamp = now()
-    entry = dict(result=result, notes=notes, at=stamp, author=settings.consultant)
+    entry = dict(result=result, notes=notes, at=stamp, author=(security.actor() if security.principal.get() else settings.consultant))
     item.setdefault('verification_history', []).append(entry)
     item['verification'] = entry
     item['updated_at'] = stamp
@@ -446,18 +467,26 @@ def update_investigation(item, action, data):
         raise ValueError('Unknown action.')
     item['updated_at'] = now()
     event_source = data.get('source_reference', 'Investigation workspace') if action == 'note' else 'Investigation workspace'
-    item['timeline'].append(dict(at=item['updated_at'], kind=data.get('kind', 'Note') if action == 'note' else action.capitalize(), text=message, author=settings.consultant, source=event_source))
+    item['timeline'].append(dict(at=item['updated_at'], kind=data.get('kind', 'Note') if action == 'note' else action.capitalize(), text=message, author=(security.actor() if security.principal.get() else settings.consultant), source=event_source))
     save(item, action)
     return item
 
 
 class Handler(BaseHTTPRequestHandler):
+    def setup(self):
+        super().setup()
+        self.connection.settimeout(30)
+
     def respond(self, status, body, content_type='application/json; charset=utf-8'):
         payload = json.dumps(body).encode() if content_type.startswith('application/json') else body
         self.send_response(status)
         self.send_header('Content-Type', content_type)
         self.send_header('Content-Length', str(len(payload)))
         self.send_header('Cache-Control', 'no-store')
+        if getattr(self, 'session_cookie', None):
+            self.send_header('Set-Cookie', self.session_cookie)
+            self.session_cookie = None
+        self.send_header('Referrer-Policy', 'no-referrer')
         self.send_header('X-Content-Type-Options', 'nosniff')
         self.send_header('Content-Security-Policy', "default-src 'self'; style-src 'self'; script-src 'self'; img-src 'self' data:; frame-ancestors 'none'; base-uri 'none'; form-action 'self'")
         self.end_headers()
@@ -467,10 +496,26 @@ class Handler(BaseHTTPRequestHandler):
         return self.headers.get('Host', '') in {f'127.0.0.1:{self.server.server_port}', f'localhost:{self.server.server_port}'}
 
     def do_GET(self):
+        token = None
         try:
+            path = urlsplit(self.path).path
+            if not self.trusted_host():
+                return self.respond(403, {'error': 'Untrusted host.'})
+            if path == '/api/auth/status':
+                return self.respond(200, {'setup_required': store.db.users.count_documents({}) == 0})
+            if path.startswith('/api/'):
+                token = security_http.establish(self, store.db)
+                if security_http.get(self, path, store):
+                    return
+                security.audit(store.db, 'api.read', path)
             self.get()
+        except security.SecurityError as exc:
+            self.respond(exc.status, {'error': str(exc)})
         except PyMongoError:
             self.respond(503, {'error': 'MongoDB is unavailable. Start MongoDB or check MONGODB_URI in .env, then restart the server.'})
+        finally:
+            if token is not None:
+                security.principal.reset(token)
 
     def get(self):
         if not self.trusted_host():
@@ -479,17 +524,34 @@ class Handler(BaseHTTPRequestHandler):
         if path == '/api/state':
             investigations = records('investigation')
             investigations = [{**item, 'lifecycle': lifecycle_view(item)} for item in investigations]
-            return self.respond(200, dict(customer=CUSTOMER, user=settings.consultant, mode='MongoDB workspace', investigations=investigations, sources=records('source'), insights=workspace_insights(investigations), services=health()))
+            return self.respond(200, dict(customer=CUSTOMER if CUSTOMER in security.principal.get()['customers'] else security.principal.get()['customers'][0], customers=security.principal.get()['customers'], user=(security.actor() if security.principal.get() else settings.consultant), mode='MongoDB workspace', investigations=investigations, sources=records('source'), insights=workspace_insights(investigations), services=health()))
         if path == '/api/health':
             status = health()
             return self.respond(200 if status['database'] == 'Connected' else 503, status)
-        assets = {'/': ('index.html', 'text/html; charset=utf-8'), '/app.js': ('app.js', 'text/javascript; charset=utf-8'), '/styles.css': ('styles.css', 'text/css; charset=utf-8')}
+        assets = {'/logo.png': ('solution-atlas-logo.png', 'image/png'), '/': ('index.html', 'text/html; charset=utf-8'), '/app.js': ('app.js', 'text/javascript; charset=utf-8'), '/history-ui.js': ('history-ui.js', 'text/javascript; charset=utf-8'), '/security-ui.js': ('security-ui.js', 'text/javascript; charset=utf-8'), '/styles.css': ('styles.css', 'text/css; charset=utf-8')}
         if path in assets:
             filename, mime = assets[path]
             return self.respond(200, (ROOT / 'static' / filename).read_bytes(), mime)
         return self.respond(404, {'error': 'Not found.'})
 
     def do_POST(self):
+        token = None
+        try:
+            path = urlsplit(self.path).path
+            if path not in ('/api/auth/login', '/api/auth/bootstrap'):
+                token = security_http.establish(self, store.db, write=True)
+                security_http.authorize(path)
+            self.post()
+        except security.SecurityError as exc:
+            security.audit(store.db, 'api.denied', urlsplit(self.path).path, result='denied')
+            self.respond(exc.status, {'error': str(exc)})
+        except PyMongoError:
+            self.respond(503, {'error': 'Security storage unavailable. Request was not completed.'})
+        finally:
+            if token is not None:
+                security.principal.reset(token)
+
+    def post(self):
         origin = self.headers.get('Origin')
         if not self.trusted_host() or (origin and origin not in {f'http://127.0.0.1:{self.server.server_port}', f'http://localhost:{self.server.server_port}'}):
             return self.respond(403, {'error': 'Untrusted request origin.'})
@@ -503,21 +565,37 @@ class Handler(BaseHTTPRequestHandler):
             if not isinstance(data, dict):
                 raise ValueError('Expected a JSON object.')
             path = urlsplit(self.path).path
+            if security_http.post(self, path, data, store, CUSTOMER):
+                return
             if path == '/api/ai/check':
                 return self.respond(200, ai.check())
             if path == '/api/extract':
-                return self.respond(200, extract_upload(data))
+                return self.respond(200, uploads.parse(data))
             if path == '/api/intake':
                 return self.respond(200, parse_intake(data, use_ai=True))
             if path == '/api/sources':
                 return self.respond(201, create_source(data, store, ai))
-            source_match = re.fullmatch(r'/api/sources/([A-Za-z0-9-]+)/(reindex|review)', path)
+            if path == '/api/history/preview':
+                return self.respond(200, uploads.parse(data, 'history'))
+            if path == '/api/history/import':
+                return self.respond(201, historical.import_documents(data, store))
+            if path == '/api/history/demo':
+                from historical_demo import install_library
+                return self.respond(201, install_library(store))
+            source_match = re.fullmatch(r'/api/sources/([A-Za-z0-9-]+)/(reindex|review|index-plan)', path)
             if source_match:
                 source = store.get(source_match[1], 'source', include_chunks=True)
                 if not source:
                     return self.respond(404, {'error': 'Source not found.'})
+                if source_match[2] == 'index-plan':
+                    return self.respond(200, {**historical.index_estimate(source, ai.config.embedding_model), 'quota': ai.quota_status()})
                 if source_match[2] == 'reindex':
+                    if data.get('confirmed') is not True:
+                        raise ValueError('Confirm sending this source text to Gemini before indexing.')
                     return self.respond(200, index_source(source, store, ai))
+                user = security.require('Reviewer')
+                if user['id'] in (source.get('created_by_id'), source.get('content_editor_id')):
+                    raise security.SecurityError('An independent reviewer must validate this source.')
                 validation = data.get('validation')
                 if validation not in ('Reviewed', 'Verified', 'Outdated'):
                     raise ValueError('Select a valid validation state.')
@@ -527,6 +605,8 @@ class Handler(BaseHTTPRequestHandler):
                     raise ValueError('Validation fields must be true or false.')
                 if validation == 'Verified' and not all(checks.values()):
                     raise ValueError('Verified sources require testing, customer confirmation and deployment evidence.')
+                if validation == 'Verified' and (historical.synthetic(source) or source.get('evidence_quality') == 'Unresolved findings'):
+                    raise ValueError('Synthetic or unresolved findings cannot be marked as a verified customer fix.')
                 conflict_text = data.get('conflicts_with', '')
                 if not isinstance(conflict_text, str) or len(conflict_text) > 2100:
                     raise ValueError('Conflicting source IDs must be comma-separated text under 2,100 characters.')
@@ -536,7 +616,7 @@ class Handler(BaseHTTPRequestHandler):
                 if any(value != source['id'] and not store.get(value, 'source') for value in conflicts):
                     raise ValueError('Each conflicting source must exist in this customer workspace or be General knowledge.')
                 source.update(validation=validation, validation_evidence=checks, review_notes=review_notes,
-                    conflicts_with=list(dict.fromkeys(conflicts)), reviewed_at=now(), reviewed_by=settings.consultant)
+                    conflicts_with=list(dict.fromkeys(conflicts)), reviewed_at=now(), reviewed_by=(security.actor() if security.principal.get() else settings.consultant))
                 if validation == 'Verified' and source.get('solution_kind') != 'Workaround':
                     source['solution_kind'] = 'Verified fix'
                 elif validation != 'Verified' and source.get('solution_kind') == 'Verified fix':
@@ -545,13 +625,17 @@ class Handler(BaseHTTPRequestHandler):
                 return self.respond(200, {k: v for k, v in source.items() if k != 'chunks'})
             if path == '/api/investigations':
                 return self.respond(201, create_investigation(data))
-            match = re.fullmatch(r'/api/investigations/([A-Za-z0-9-]+)/(analyze|decision|note|outcome|lifecycle|solutioning|approval|verification)', path)
+            match = re.fullmatch(r'/api/investigations/([A-Za-z0-9-]+)/(analyze|decision|note|outcome|lifecycle|solutioning|approval|verification|history-search|source-link)', path)
             if match:
                 item = get_record(match[1], 'investigation')
                 if not item:
                     return self.respond(404, {'error': 'Investigation not found.'})
-                if item.get('customer') != CUSTOMER:
+                if not security.customer_allowed(item.get('customer')):
                     return self.respond(404, {'error': 'Investigation not found.'})
+                if match[2] == 'history-search':
+                    return self.respond(200, historical.search(item, data, store))
+                if match[2] == 'source-link':
+                    return self.respond(200, historical.attach(item, data, store, (security.actor() if security.principal.get() else settings.consultant)))
                 if match[2] == 'lifecycle':
                     return self.respond(200, transition_lifecycle(item, data))
                 if match[2] == 'solutioning':

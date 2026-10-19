@@ -42,9 +42,15 @@ Open http://127.0.0.1:8000. On this development machine a portable MongoDB was d
 
 ## Use your own data
 
+Detailed guides: [Security implementation and company requirements](docs/SECURITY_IMPLEMENTATION_AND_COMPANY_REQUIREMENTS.md) · [Full AI functions and workflow](docs/AI_FUNCTIONS.md).
+
+Sign-in is required. On first start, use the local single-use token in `data/bootstrap-token.txt` to create your administrator account, then create independent consultant/reviewer accounts under **Users & audit**. See [Security setup and limitations](docs/SECURITY.md). Existing documents and tickets require a current independent security review before Gemini processing; new imports start Restricted with external AI blocked.
+
+Historical uploads, field mapping, synthetic reference documents and no-AI ticket linking are described in [Historical documentation](docs/HISTORICAL_DOCUMENTATION.md). Knowledge saves now default to Pending; indexing is an explicit action with a request estimate and Gemini transfer confirmation.
+
 1. Click **Check AI connection** to test one small live generation request. The dashboard shows the active generation model and ATLAS's locally tracked quota balance. After changing `.env`, restart the Python server; refreshing the browser alone does not reload configuration.
 2. In **Knowledge**, upload actual documents or paste text. TXT, MD, JSON, text-based PDF, DOCX, XLSX/XLSM/XLTX and CSV are supported, up to 5 MB. Review application, version and source reference before saving.
-3. Sources are stored in MongoDB and embedded. Failed indexing retains the document with an error and retry action. Only Ready sources with the configured embedding model are searched.
+3. Sources are stored in MongoDB without an AI request. Choose Index / reindex, review the request estimate and confirm sending the text to Gemini when ready. Failed indexing retains the document. AI retrieval searches Ready sources; local historical search also includes Pending sources.
 4. Create an investigation from actual ticket text or a document. Review and correct application, SAP platform/module, business process, release, error, customization, and timestamped ticket events before saving. Manual entry and structured JSON intake also work without a key.
 5. Run analysis. Gemini synthesizes recommendations from retrieved chunks. Every recommendation must cite a supplied source and an exact quote; invalid citations reject the response. Insufficient evidence produces diagnostic next steps.
 6. In an investigation's Overview, advance one recorded lifecycle stage at a time. Incidents and service requests use Creation → Acceptance → Acknowledgment → Clarification → Solutioning → Closure. Change requests add Approval → Development → Deployment → Verification before Closure. Each transition is timestamped and persisted; approval and verification require separate explicit evidence actions. A change cannot close unless verification Passed, except through an explicit audited cancellation/escalation/rejection exception.
